@@ -1,54 +1,64 @@
 #include <Arduino.h>
 
 // ─────────────────────────────────────────────
-//  PIN DEFINITIONS
+//  PIN DEFINITIONS (ESP32 WROOM 32E)
+//
+//  Avoided: GPIO 0,2,12,15 (strapping), GPIO 6–11 (flash),
+//           GPIO 34–39 (input-only, used for ADC only)
 // ─────────────────────────────────────────────
 
-// TB6612FNG
-#define PIN_AIN1  7   // Direction bit 1
-#define PIN_AIN2  8   // Direction bit 2
-#define PIN_PWMA  5   // PWM speed
-#define PIN_STBY  6   // Standby release
+// TB6612FNG Motor Driver
+#define PIN_AIN1  25
+#define PIN_AIN2  26
+#define PIN_PWMA  27   // LEDC output
+#define PIN_STBY  14
 
-// Encoder
-// ENCA must be on a hardware-interrupt pin (Arduino Uno: 2 or 3)
-// ENCB only needs a digital read
-#define PIN_ENCA  2   // Channel A — INT0 (rising edge interrupt)
-#define PIN_ENCB  4   // Channel B — direction sense (polled in ISR)
+// Quadrature Encoder — any GPIO is interrupt-capable on ESP32
+#define PIN_ENCA  18   // Channel A — hardware interrupt
+#define PIN_ENCB  19   // Channel B — polled inside ISR
 
 // ACS712 Current Sensor
-#define PIN_CURRENT  A0
+// ⚠️  Voltage divider required (10kΩ/10kΩ) between ACS712 OUT and this pin
+//     ACS712 runs on 5V (output 0–5V). Divider halves it → 0–2.5V (safe for 3.3V ADC)
+#define PIN_CURRENT  34  // ADC1 channel — input-only pin, ideal for analog
 
 // ─────────────────────────────────────────────
-//  ENCODER & GEARBOX CONSTANTS
-//
-//  Motor datasheet / measured:
-//    11 pulses per motor-shaft revolution (single channel, rising edges)
-//    Gear ratio: 1 : 472.7272  (472.7272 motor turns → 1 output turn)
-//
-//  Verification:
-//    At 100% PWM the encoder fires at ~520 Hz
-//    520 Hz / 11 pulses = 47.27 motor rev/s = 2836 RPM motor
-//    2836 RPM / 472.7272 = 6 RPM output 
-//
-//  Pulses per OUTPUT revolution = 11 × 472.7272 ≈ 5200
+//  LEDC (ESP32 PWM) CONFIGURATION
+//  Using 8-bit resolution so the 0–255 user interface stays identical
 // ─────────────────────────────────────────────
-static constexpr float    PULSES_PER_MOTOR_REV  = 11.0f;
-static constexpr float    GEAR_RATIO            = 472.727272f;
-static constexpr float    PULSES_PER_OUTPUT_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
-
-// RPM is recalculated every this many milliseconds
-static constexpr uint32_t RPM_WINDOW_MS         = 1000;
+#define LEDC_CHANNEL    0
+#define LEDC_FREQ_HZ    5000   // 5 kHz — good for most DC motors
+#define LEDC_RESOLUTION 8      // 8-bit → duty range 0–255
 
 // ─────────────────────────────────────────────
 //  ACS712 CONSTANTS
-//  Formula: mV = -180·A + 2500  ->  A = (2500 - mV) / 180
+//
+//  Sensor powered at 5V:  mV_sensor = -180·A + 2500
+//  After 10k/10k divider: mV_adc    = mV_sensor / 2
+//  ESP32 ADC reference:   3300 mV, 12-bit (0–4095)
+//
+//  Solving for current:
+//    mV_sensor = mV_adc × 2
+//    A = (2500 - mV_sensor) / 180
+//      = (2500 - mV_adc × 2) / 180
 // ─────────────────────────────────────────────
-static constexpr float ACS712_ZERO_MV   = 2500.0f;
-static constexpr float ACS712_SENS_MV_A =  180.0f;
-static constexpr float VCC_MV           = 5000.0f;
-static constexpr float ADC_RESOLUTION   = 1024.0f;
-static constexpr int   CURRENT_SAMPLES  = 30;
+static constexpr float ACS712_ZERO_MV    = 2500.0f; // Sensor zero-current output (mV)
+static constexpr float ACS712_SENS_MV_A  =  180.0f; // Sensitivity magnitude (mV/A)
+static constexpr float DIVIDER_RATIO     =    2.0f;  // Voltage divider ratio (10k+10k)
+static constexpr float ADC_REF_MV        = 3300.0f;  // ESP32 ADC reference (mV)
+static constexpr float ADC_RESOLUTION    = 4095.0f;  // 12-bit
+static constexpr int   CURRENT_SAMPLES   =   30;
+
+// ─────────────────────────────────────────────
+//  ENCODER & GEARBOX CONSTANTS
+//  11 pulses/motor-rev, gear ratio 1:472.7272
+//  → 5200 pulses per output revolution
+// ─────────────────────────────────────────────
+static constexpr float    PULSES_PER_MOTOR_REV  =   11.0f;
+static constexpr float    GEAR_RATIO            =  472.7272f;
+static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
+
+static constexpr uint32_t RPM_WINDOW_MS         = 1000;
 
 // ─────────────────────────────────────────────
 //  TELEMETRY TIMING
@@ -66,19 +76,21 @@ struct MotorState {
 } motor;
 
 // ─────────────────────────────────────────────
-//  ENCODER STATE  (volatile: shared with ISR)
+//  ENCODER STATE
 //
-//  encoderPulses: signed running total of rising edges on ENCA.
-//    Incremented when ENCB is HIGH at the moment ENCA rises: forward.
-//    Decremented when ENCB is LOW  at the moment ENCA rises: reverse.
-//    This is direction-aware, so reversing the motor winds the count back.
+//  volatile: shared between ISR and main loop.
+//  On ESP32 (32-bit Xtensa), a 32-bit aligned read is atomic at the hardware
+//  level, but FreeRTOS can preempt tasks, so we still use critical sections
+//  to be safe and to satisfy the compiler's memory-ordering requirements.
 // ─────────────────────────────────────────────
 volatile long encoderPulses = 0;
 
-// RPM tracking (non-volatile; only written in main loop with interrupts off)
 long     rpmPulseSnapshot = 0;
 uint32_t rpmLastCalcMs    = 0;
 float    outputRPM        = 0.0f;
+
+// FreeRTOS critical section handle (used instead of noInterrupts on ESP32)
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ─────────────────────────────────────────────
 //  PROTOTYPES
@@ -90,26 +102,28 @@ void  processCommand(const String& raw);
 void  updateRPM();
 void  printTelemetry(float amps);
 void  printHelp();
-void  encoderISR();   // Interrupt Service Routine
+void  IRAM_ATTR encoderISR();
 
 // ═════════════════════════════════════════════
 //  ENCODER ISR
-//  Called on every RISING edge of ENCA.
-//  Reads ENCB immediately to determine direction.
 //
-//  Quadrature truth table (standard):
-//    ENCA LOW while ENCB HIGH: forward  (+1)
-//    ENCA HIGH while ENCB LOW:  reverse  (-1)
+//  IRAM_ATTR: forces the function into IRAM (internal RAM) so it can execute
+//  even if the flash cache is busy. Required for ISRs on ESP32.
 //
-//  Note: digitalRead inside an ISR is safe on AVR but adds ~3–4 µs.
-//  At 520 Hz max pulse rate the ISR fires every ~1.9 ms.
+//  portENTER/EXIT_CRITICAL_ISR: FreeRTOS-safe spinlock for ISR context.
+//  Use this instead of noInterrupts() inside an ISR on ESP32.
+//
+//  Direction: ENCA ↑ while ENCB=HIGH → forward (+1)
+//             ENCA ↑ while ENCB=LOW  → reverse (-1)
 // ═════════════════════════════════════════════
-void encoderISR() {
+void IRAM_ATTR encoderISR() {
+  portENTER_CRITICAL_ISR(&encoderMux);
   if (digitalRead(PIN_ENCB) == HIGH) {
     encoderPulses++;
   } else {
     encoderPulses--;
   }
+  portEXIT_CRITICAL_ISR(&encoderMux);
 }
 
 // ═════════════════════════════════════════════
@@ -117,24 +131,27 @@ void encoderISR() {
 // ═════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {}
 
   // Motor driver pins
   pinMode(PIN_AIN1, OUTPUT);
   pinMode(PIN_AIN2, OUTPUT);
-  pinMode(PIN_PWMA, OUTPUT);
   pinMode(PIN_STBY, OUTPUT);
+  // PIN_PWMA configured by LEDC — do NOT call pinMode on it separately
 
-  // Encoder pins — INPUT_PULLUP in case the encoder has open-collector outputs.
-  // If encoder has its own pull-ups, INPUT also works fine.
+  // LEDC setup — replaces analogWrite() on ESP32
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQ_HZ, LEDC_RESOLUTION);
+  ledcAttachPin(PIN_PWMA, LEDC_CHANNEL);
+
+  // Encoder pins
+  // INPUT_PULLUP in case encoder has open-collector outputs
   pinMode(PIN_ENCA, INPUT_PULLUP);
   pinMode(PIN_ENCB, INPUT_PULLUP);
 
-  // Attach interrupt — RISING edge only (counts one edge per pulse)
+  // Any GPIO can trigger interrupts on ESP32 — no pin constraint like the Uno
   attachInterrupt(digitalPinToInterrupt(PIN_ENCA), encoderISR, RISING);
 
   stopMotor();
-  digitalWrite(PIN_STBY, HIGH);   // Release driver from standby
+  digitalWrite(PIN_STBY, HIGH);  // Release driver from standby
 
   rpmLastCalcMs = millis();
   printHelp();
@@ -146,7 +163,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  updateRPM();  // Non-blocking, runs on its own timer
+  updateRPM();
 
   if (now - lastTelemetry >= TELEMETRY_MS) {
     lastTelemetry = now;
@@ -161,29 +178,17 @@ void loop() {
 }
 
 // ═════════════════════════════════════════════
-//  RPM CALCULATION  (non-blocking, called every loop)
-//
-//  Strategy: once per RPM_WINDOW_MS, snapshot encoderPulses
-//  with interrupts disabled (prevents a torn read of the long),
-//  compute the delta since the last snapshot, then convert:
-//
-//    RPM_output = (delta_pulses / pulses_per_output_rev)
-//                 / (elapsed_ms / 60000)
-//
-//  This handles any PWM: slower PWM = fewer pulses = lower RPM.
-//  The signed delta also gives negative RPM when running in reverse,
-//  which is useful for debugging direction issues.
+//  RPM CALCULATION
 // ═════════════════════════════════════════════
 void updateRPM() {
-  uint32_t now = millis();
+  uint32_t now     = millis();
   uint32_t elapsed = now - rpmLastCalcMs;
-
   if (elapsed < RPM_WINDOW_MS) return;
 
-  // Atomically read the volatile long (AVR: 4 bytes, not atomic by default)
-  noInterrupts();
+  // FreeRTOS-safe read of volatile long from main-loop context
+  portENTER_CRITICAL(&encoderMux);
   long currentPulses = encoderPulses;
-  interrupts();
+  portEXIT_CRITICAL(&encoderMux);
 
   long  deltaPulses = currentPulses - rpmPulseSnapshot;
   float elapsedMin  = (float)elapsed / 60000.0f;
@@ -202,7 +207,7 @@ void processCommand(const String& raw) {
 
   // ── S <0-255> / SPEED <0-255> ───────────────
   if (cmd.startsWith("S ") || cmd.startsWith("SPEED ")) {
-    int sp = cmd.substring(cmd.indexOf(' ') + 1).toInt();
+    int sp    = cmd.substring(cmd.indexOf(' ') + 1).toInt();
     motor.pwm = (uint8_t)constrain(sp, 0, 255);
     if (motor.running) applyMotor();
     Serial.print(F("[OK] PWM set to "));
@@ -237,9 +242,9 @@ void processCommand(const String& raw) {
 
   // ── ENC — on-demand encoder snapshot ────────
   } else if (cmd == F("ENC") || cmd == F("ENCODER")) {
-    noInterrupts();
+    portENTER_CRITICAL(&encoderMux);
     long p = encoderPulses;
-    interrupts();
+    portEXIT_CRITICAL(&encoderMux);
     float outputRevs = (float)p / PULSES_PER_OUTPUT_REV;
     Serial.print(F("[ENC] Pulses="));
     Serial.print(p);
@@ -250,9 +255,9 @@ void processCommand(const String& raw) {
 
   // ── RESET — zero the encoder counter ────────
   } else if (cmd == F("RESET")) {
-    noInterrupts();
+    portENTER_CRITICAL(&encoderMux);
     encoderPulses = 0;
-    interrupts();
+    portEXIT_CRITICAL(&encoderMux);
     rpmPulseSnapshot = 0;
     outputRPM        = 0.0f;
     Serial.println(F("[OK] Encoder counter reset to 0"));
@@ -263,7 +268,7 @@ void processCommand(const String& raw) {
     Serial.print(readCurrentAmps(), 4);
     Serial.println(F(" A"));
 
-  // ── STBY ON/OFF ──────────────────────────────
+  // ── STBY ON/OFF ─────────────────────────────
   } else if (cmd == F("STBY ON")) {
     digitalWrite(PIN_STBY, HIGH);
     Serial.println(F("[OK] STBY HIGH — driver enabled"));
@@ -285,12 +290,7 @@ void processCommand(const String& raw) {
 
 // ═════════════════════════════════════════════
 //  MOTOR CONTROL
-//  TB6612FNG truth table:
-//   AIN1  AIN2  → AOUT
-//    H     L    → Forward (CW)
-//    L     H    → Reverse (CCW)
-//    L     L    → Coast
-//    H     H    → Brake
+//  Uses ledcWrite() instead of analogWrite()
 // ═════════════════════════════════════════════
 void applyMotor() {
   if (!motor.running || motor.pwm == 0) { stopMotor(); return; }
@@ -301,17 +301,25 @@ void applyMotor() {
     digitalWrite(PIN_AIN1, LOW);
     digitalWrite(PIN_AIN2, HIGH);
   }
-  analogWrite(PIN_PWMA, motor.pwm);
+  ledcWrite(LEDC_CHANNEL, motor.pwm);
 }
 
 void stopMotor() {
   digitalWrite(PIN_AIN1, LOW);
   digitalWrite(PIN_AIN2, LOW);
-  analogWrite(PIN_PWMA, 0);
+  ledcWrite(LEDC_CHANNEL, 0);
 }
 
 // ═════════════════════════════════════════════
 //  CURRENT SENSING
+//
+//  ADC reads voltage at the divider midpoint (mV_adc = mV_sensor / 2).
+//  Reconstruct sensor voltage then apply ACS712 formula:
+//    A = (2500 - mV_sensor) / 180
+//
+//  Note: ESP32 ADC has known non-linearity near 0V and 3.3V rails.
+//  For higher accuracy in a future revision, use analogReadMilliVolts()
+//  (available in ESP-IDF / Arduino-ESP32 ≥ v2.0) with ADC calibration.
 // ═════════════════════════════════════════════
 float readCurrentAmps() {
   long sum = 0;
@@ -319,18 +327,19 @@ float readCurrentAmps() {
     sum += analogRead(PIN_CURRENT);
     delayMicroseconds(250);
   }
-  float avgADC = (float)sum / CURRENT_SAMPLES;
-  float voutMV = (avgADC / ADC_RESOLUTION) * VCC_MV;
-  return (ACS712_ZERO_MV - voutMV) / ACS712_SENS_MV_A;
+  float avgADC    = (float)sum / CURRENT_SAMPLES;
+  float adcMV     = (avgADC / ADC_RESOLUTION) * ADC_REF_MV;   // mV at ADC pin
+  float sensorMV  = adcMV * DIVIDER_RATIO;                     // reconstruct full sensor output
+  return (ACS712_ZERO_MV - sensorMV) / ACS712_SENS_MV_A;
 }
 
 // ═════════════════════════════════════════════
 //  SERIAL OUTPUT
 // ═════════════════════════════════════════════
 void printTelemetry(float amps) {
-  noInterrupts();
+  portENTER_CRITICAL(&encoderMux);
   long p = encoderPulses;
-  interrupts();
+  portEXIT_CRITICAL(&encoderMux);
   float outputRevs = (float)p / PULSES_PER_OUTPUT_REV;
 
   Serial.print(F("[TEL] I="));
@@ -351,7 +360,7 @@ void printTelemetry(float amps) {
 
 void printHelp() {
   Serial.println(F("╔════════════════════════════════════════════════╗"));
-  Serial.println(F("║   Infusion Pump — Open Loop + Encoder          ║"));
+  Serial.println(F("║  Infusion Pump — ESP32 Open Loop + Encoder     ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
   Serial.println(F("║  S <0-255>    Set PWM speed                    ║"));
   Serial.println(F("║  F / FWD      Direction → Forward              ║"));
@@ -360,7 +369,7 @@ void printHelp() {
   Serial.println(F("║  STOP / X     Stop motor (coast)               ║"));
   Serial.println(F("║  C            Read current (A)                 ║"));
   Serial.println(F("║  ENC          Read encoder position & RPM      ║"));
-  Serial.println(F("║  RESET        Zero the encoder counter         ║"));
+  Serial.println(F("║  RESET        Zero encoder counter             ║"));
   Serial.println(F("║  STBY ON/OFF  Enable / disable driver          ║"));
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
