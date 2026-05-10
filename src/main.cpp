@@ -58,12 +58,16 @@ static constexpr float    PULSES_PER_MOTOR_REV  =   11.0f;
 static constexpr float    GEAR_RATIO            =  472.7272f;
 static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
 
-static constexpr uint32_t RPM_WINDOW_MS         = 50;  // Window for RPM averaging (increased to smooth quantization)
+static constexpr uint32_t RPM_WINDOW_MS         = 10;  // Window for RPM averaging — match telemetry for smoother updates
+
+// Low-pass filter for speed estimate.
+// This smooths quantization from integer pulse counts while keeping 10 ms telemetry updates.
+static constexpr uint32_t SPEED_FILTER_TAU_MS   = 100;
 
 // ─────────────────────────────────────────────
 //  TELEMETRY TIMING
 // ─────────────────────────────────────────────
-static constexpr uint32_t TELEMETRY_MS = 10;  // ⚠️  IMPORTANT: Change this if needed!
+static constexpr uint32_t TELEMETRY_MS = 10;  // ⚠️  IMPORTANT: Match MATLAB's TELEMETRY_MS
                                                // For fast motor transients (<100ms), use 5-10ms
                                                // For slower motors, 20ms is OK
                                                // MUST match TELEMETRY_MS in MATLAB read-esp32.m
@@ -92,6 +96,7 @@ long     rpmPulseSnapshot = 0;
 uint32_t rpmLastCalcMs    = 0;
 float    outputRPM        = 0.0f;
 float    omega            = 0.0f; 
+bool     speedFilterInit  = false;
 
 // FreeRTOS critical section handle (used instead of noInterrupts on ESP32)
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
@@ -122,7 +127,11 @@ void  IRAM_ATTR encoderISR();
 // ═════════════════════════════════════════════
 void IRAM_ATTR encoderISR() {
   portENTER_CRITICAL_ISR(&encoderMux);
-  if (digitalRead(PIN_ENCB) == HIGH) {
+  // Read both channels to determine direction. Triggered on CHANGE of ENCA,
+  // counting both edges improves effective resolution (x2).
+  int a = digitalRead(PIN_ENCA);
+  int b = digitalRead(PIN_ENCB);
+  if (a == b) {
     encoderPulses++;
   } else {
     encoderPulses--;
@@ -152,7 +161,8 @@ void setup() {
   pinMode(PIN_ENCB, INPUT_PULLUP);
 
   // Any GPIO can trigger interrupts on ESP32 — no pin constraint like the Uno
-  attachInterrupt(digitalPinToInterrupt(PIN_ENCA), encoderISR, RISING);
+  // Use CHANGE to count both edges of ENCA (improves resolution)
+  attachInterrupt(digitalPinToInterrupt(PIN_ENCA), encoderISR, CHANGE);
 
   stopMotor();
   digitalWrite(PIN_STBY, HIGH);  // Release driver from standby
@@ -197,8 +207,20 @@ void updateRPM() {
   long  deltaPulses = currentPulses - rpmPulseSnapshot;
   float elapsedMin  = (float)elapsed / 60000.0f;
 
-  outputRPM        = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedMin;
-  omega            = (outputRPM / 60.0f) * 2.0f * PI;
+  float rpmRaw   = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedMin;
+  float omegaRaw = (rpmRaw / 60.0f) * 2.0f * PI;
+
+  // Exponential moving average to reduce staircase quantization from pulse counts.
+  float alpha = (float)elapsed / ((float)SPEED_FILTER_TAU_MS + (float)elapsed);
+  if (!speedFilterInit) {
+    outputRPM       = rpmRaw;
+    omega           = omegaRaw;
+    speedFilterInit = true;
+  } else {
+    outputRPM += alpha * (rpmRaw - outputRPM);
+    omega     += alpha * (omegaRaw - omega);
+  }
+
   rpmPulseSnapshot = currentPulses;
   rpmLastCalcMs    = now;
 }
@@ -265,6 +287,8 @@ void processCommand(const String& raw) {
     portEXIT_CRITICAL(&encoderMux);
     rpmPulseSnapshot = 0;
     outputRPM        = 0.0f;
+    omega            = 0.0f;
+    speedFilterInit   = false;
     Serial.println(F("[OK] Encoder counter reset to 0"));
 
   // ── C / CURRENT — on-demand reading ─────────
@@ -379,7 +403,7 @@ void printHelp() {
   Serial.println(F("║  STBY ON/OFF  Enable / disable driver          ║"));
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
-  Serial.println(F("║  Telemetry every 10 ms | RPM window: 50 ms     ║"));
+  Serial.println(F("║  Telemetry every 10 ms | RPM window: 10 ms     ║"));
   Serial.println(F("║  Gear ratio 1:472.73 → 5200 pulses/output rev  ║"));
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }

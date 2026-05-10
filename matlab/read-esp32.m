@@ -32,7 +32,7 @@ TEST_TIME     = 3;      % seconds (need ≥2s for motor to fully settle + captur
 SUPPLY_VOLT   = 12.0;    % motor supply voltage
 
 % TELEMETRY CONFIG — must match ESP32 main.cpp
-TELEMETRY_MS  = 10;     % Sampling interval in milliseconds
+TELEMETRY_MS  = 10;     % Sampling interval in milliseconds (must match ESP32)
 
 %% ---------------------------------------------------------
 % RESET MOTOR
@@ -252,7 +252,7 @@ fprintf('b = %.6e N.m.s/rad\n', b0);
 
 %% ---------------------------------------------------------
 % PARAMETER BOUNDS (Adjusted for realistic motor parameters)
-%% ---------------------------------------------------------
+% ---------------------------------------------------------
 
 lb = [1e-5   1e-7   0.01   1e-6];   % L, J, K, b lower bounds
 ub = [10     1e-2   100    1];      % L, J, K, b upper bounds
@@ -275,7 +275,32 @@ costFun = @(x) motorCost(x, R0, t, omega, Va);
 
 disp("Running optimization...");
 
-xopt = fmincon(costFun, x0, [], [], [], [], lb, ub);
+% Validate measured data before optimization
+if length(t) < 10 || length(omega) < 10
+    warning('Not enough data points for reliable optimization (need >=10). Skipping optimization.');
+    xopt = x0;
+else
+    % Evaluate cost at initial guess to ensure objective is defined
+    cost0 = costFun(x0);
+    if ~isfinite(cost0) || cost0 > 1e11
+        warning('Initial cost is invalid (%.3e). Replacing initial guess with safe defaults.', cost0);
+        x0 = [1e-3, 1e-4, max(K0,0.01), 1e-3];
+        cost0 = costFun(x0);
+    end
+
+    if ~isfinite(cost0) || cost0 > 1e11
+        warning('Cost at fallback initial guess still invalid. Skipping optimization and using fallback parameters.');
+        xopt = x0;
+    else
+        try
+            opts = optimoptions('fmincon','Display','iter','MaxFunctionEvaluations',2000);
+            xopt = fmincon(costFun, x0, [], [], [], [], lb, ub, [], opts);
+        catch ME
+            warning('fmincon failed: %s\nUsing initial guess as solution.', ME.message);
+            xopt = x0;
+        end
+    end
+end
 
 L = xopt(1);
 J = xopt(2);
