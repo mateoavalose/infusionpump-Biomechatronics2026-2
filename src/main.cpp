@@ -47,7 +47,7 @@ static constexpr float ACS712_SENS_MV_A  =  180.0f; // Sensitivity magnitude (mV
 static constexpr float DIVIDER_RATIO     =    2.0f;  // Voltage divider ratio (10k+10k)
 static constexpr float ADC_REF_MV        = 3300.0f;  // ESP32 ADC reference (mV)
 static constexpr float ADC_RESOLUTION    = 4095.0f;  // 12-bit
-static constexpr int   CURRENT_SAMPLES   =   30;
+static constexpr int   CURRENT_SAMPLES   =   10;
 
 // ─────────────────────────────────────────────
 //  ENCODER & GEARBOX CONSTANTS
@@ -58,12 +58,15 @@ static constexpr float    PULSES_PER_MOTOR_REV  =   11.0f;
 static constexpr float    GEAR_RATIO            =  472.7272f;
 static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
 
-static constexpr uint32_t RPM_WINDOW_MS         = 1000;
+static constexpr uint32_t RPM_WINDOW_MS         = 50;  // Window for RPM averaging (increased to smooth quantization)
 
 // ─────────────────────────────────────────────
 //  TELEMETRY TIMING
 // ─────────────────────────────────────────────
-static constexpr uint32_t TELEMETRY_MS = 500;
+static constexpr uint32_t TELEMETRY_MS = 10;  // ⚠️  IMPORTANT: Change this if needed!
+                                               // For fast motor transients (<100ms), use 5-10ms
+                                               // For slower motors, 20ms is OK
+                                               // MUST match TELEMETRY_MS in MATLAB read-esp32.m
 static uint32_t lastTelemetry          = 0;
 
 // ─────────────────────────────────────────────
@@ -88,6 +91,7 @@ volatile long encoderPulses = 0;
 long     rpmPulseSnapshot = 0;
 uint32_t rpmLastCalcMs    = 0;
 float    outputRPM        = 0.0f;
+float    omega            = 0.0f; 
 
 // FreeRTOS critical section handle (used instead of noInterrupts on ESP32)
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
@@ -194,6 +198,7 @@ void updateRPM() {
   float elapsedMin  = (float)elapsed / 60000.0f;
 
   outputRPM        = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedMin;
+  omega            = (outputRPM / 60.0f) * 2.0f * PI;
   rpmPulseSnapshot = currentPulses;
   rpmLastCalcMs    = now;
 }
@@ -302,6 +307,7 @@ void applyMotor() {
     digitalWrite(PIN_AIN2, HIGH);
   }
   ledcWrite(LEDC_CHANNEL, motor.pwm);
+  Serial.println(F("[STEP_APPLIED]"));  // Exact timing marker for MATLAB sync
 }
 
 void stopMotor() {
@@ -337,25 +343,25 @@ float readCurrentAmps() {
 //  SERIAL OUTPUT
 // ═════════════════════════════════════════════
 void printTelemetry(float amps) {
+
   portENTER_CRITICAL(&encoderMux);
   long p = encoderPulses;
   portEXIT_CRITICAL(&encoderMux);
-  float outputRevs = (float)p / PULSES_PER_OUTPUT_REV;
+  uint32_t t = millis();
 
-  Serial.print(F("[TEL] I="));
-  Serial.print(amps, 3);
-  Serial.print(F(" A | PWM="));
+  Serial.print(t);
+  Serial.print(",");
   Serial.print(motor.pwm);
-  Serial.print(F("/255 | Dir="));
-  Serial.print(motor.forward ? F("FWD") : F("REV"));
-  Serial.print(F(" | Motor="));
-  Serial.print(motor.running ? F("ON ") : F("OFF"));
-  Serial.print(F(" | Pulses="));
+  Serial.print(",");
+  Serial.print(motor.forward ? 1 : -1);
+  Serial.print(",");
   Serial.print(p);
-  Serial.print(F(" | Revs="));
-  Serial.print(outputRevs, 4);
-  Serial.print(F(" | RPM="));
-  Serial.println(outputRPM, 2);
+  Serial.print(",");
+  Serial.print(outputRPM, 4);
+  Serial.print(",");
+  Serial.print(omega, 4);
+  Serial.print(",");
+  Serial.println(amps, 5);
 }
 
 void printHelp() {
@@ -373,7 +379,7 @@ void printHelp() {
   Serial.println(F("║  STBY ON/OFF  Enable / disable driver          ║"));
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
-  Serial.println(F("║  Telemetry every 500 ms | RPM window: 1000 ms  ║"));
+  Serial.println(F("║  Telemetry every 10 ms | RPM window: 50 ms     ║"));
   Serial.println(F("║  Gear ratio 1:472.73 → 5200 pulses/output rev  ║"));
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }
