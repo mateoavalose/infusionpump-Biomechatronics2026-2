@@ -27,12 +27,20 @@ disp("Connected to ESP32");
 % USER PARAMETERS
 % ---------------------------------------------------------
 
-PWM_STEP      = 255;
-TEST_TIME     = 3;      % seconds (need ≥2s for motor to fully settle + capture dynamics)
-SUPPLY_VOLT   = 12.0;    % motor supply voltage
+TARGET_SPEED_RPM = 3.0;   % desired speed setpoint shown in plots
+TEST_TIME        = 60;     % seconds (need >=2s for motor to fully settle + capture dynamics)
+SUPPLY_VOLT      = 12.0;  % motor supply voltage
 
 % TELEMETRY CONFIG — must match ESP32 main.cpp
-TELEMETRY_MS  = 10;     % Sampling interval in milliseconds (must match ESP32)
+TELEMETRY_MS     = 10;    % Sampling interval in milliseconds (must match ESP32)
+
+% Open-loop feedforward guess used to convert speed setpoint into PWM.
+% The optimized model later computes a better PWM for the target speed.
+PWM_PER_RPM_EST  = 40.0;
+PWM_STEP         = min(max(round(TARGET_SPEED_RPM * PWM_PER_RPM_EST), 1), 255);
+
+fprintf('Target speed setpoint = %.2f rpm\n', TARGET_SPEED_RPM);
+fprintf('Initial feedforward PWM command = %d\n', PWM_STEP);
 
 %% ---------------------------------------------------------
 % RESET MOTOR
@@ -48,7 +56,7 @@ pause(0.5);
 % START STEP RESPONSE TEST
 % ---------------------------------------------------------
 
-disp("Starting step test...");
+disp("Starting speed-setpoint test...");
 
 writeline(s, sprintf("S %d", PWM_STEP));
 pause(0.1);
@@ -136,17 +144,24 @@ else
     disp('[MATLAB] No STEP_APPLIED marker detected. Using first data point as t=0.');
 end
 
+% Convert speed to rpm for plotting and setpoint comparison
+rpm_meas = omega * 60.0 / (2.0 * pi);
+rpm_setpoint = TARGET_SPEED_RPM * ones(size(t));
+
 % ---------------------------------------------------------
-% PLOT RAW RESPONSE
+% PLOT MEASURED RESPONSE VS SPEED SETPOINT
 % ---------------------------------------------------------
 
 figure;
-plot(t, omega, 'LineWidth', 2);
+plot(t, rpm_meas, 'LineWidth', 2);
+hold on;
+plot(t, rpm_setpoint, '--', 'LineWidth', 2);
 grid on;
 
 xlabel('Time [s]');
-ylabel('\omega [rad/s]');
-title('Measured Motor Step Response');
+ylabel('Speed [rpm]');
+title('Measured Speed Response vs Target Setpoint');
+legend('Measured speed', 'Target speed');
 
 % ---------------------------------------------------------
 % ESTIMATE STEADY STATE VALUE
@@ -212,6 +227,9 @@ Va = (PWM_STEP / 255) * SUPPLY_VOLT;
 
 fprintf('\nEstimated input voltage = %.3f V\n', Va);
 
+rpm_ss_meas = omega_ss * 60.0 / (2.0 * pi);
+fprintf('Measured steady-state speed = %.3f rpm\n', rpm_ss_meas);
+
 %% ---------------------------------------------------------
 % INITIAL PARAMETER ESTIMATES
 % ---------------------------------------------------------
@@ -270,6 +288,27 @@ fprintf('b: [%.2e, %.2e] N.m.s/rad\n', lb(4), ub(4));
 costFun = @(x) motorCost(x, R0, t, omega, Va);
 
 % ---------------------------------------------------------
+% BASELINE MODEL PLOT BEFORE OPTIMIZATION
+% ---------------------------------------------------------
+
+s_tf = tf('s');
+[y_base, t_base] = step(Va * (K0 / ((J0*s_tf + b0)*(L0*s_tf + R0) + K0^2)), t(end));
+rpm_base = y_base * 60.0 / (2.0 * pi);
+rpm_base_on_meas = interp1(t_base, rpm_base, t, 'linear', 'extrap');
+
+figure;
+plot(t, rpm_meas, 'LineWidth', 2);
+hold on;
+plot(t, rpm_base_on_meas, '--', 'LineWidth', 2);
+plot(t, rpm_setpoint, ':', 'LineWidth', 2);
+grid on;
+
+xlabel('Time [s]');
+ylabel('Speed [rpm]');
+title('Pre-Optimization Model vs Measured Speed');
+legend('Measured speed', 'Initial model', 'Target speed');
+
+% ---------------------------------------------------------
 % OPTIMIZATION
 % ---------------------------------------------------------
 
@@ -312,8 +351,6 @@ R = R0;
 % BUILD TRANSFER FUNCTION
 % ---------------------------------------------------------
 
-s_tf = tf('s');
-
 G = K / ((J*s_tf + b)*(L*s_tf + R) + K^2);
 
 %% ---------------------------------------------------------
@@ -322,25 +359,35 @@ G = K / ((J*s_tf + b)*(L*s_tf + R) + K^2);
 
 [y_model, t_model] = step(Va * G, t(end));
 
+rpm_model = y_model * 60.0 / (2.0 * pi);
+rpm_model_on_meas = interp1(t_model, rpm_model, t, 'linear', 'extrap');
+
+% Feedforward PWM required by the optimized model to reach the target speed.
+dc_gain = K / (b * R + K^2);
+omega_target = TARGET_SPEED_RPM * (2.0 * pi / 60.0);
+va_for_target = omega_target / max(dc_gain, eps);
+pwm_for_target = min(max(round((va_for_target / SUPPLY_VOLT) * 255.0), 1), 255);
+
 % ---------------------------------------------------------
 % COMPARE MODEL VS REAL
 % ---------------------------------------------------------
 
 figure;
 
-plot(t, omega, 'LineWidth', 2);
+plot(t, rpm_meas, 'LineWidth', 2);
 hold on;
 
-plot(t_model, y_model, '--', 'LineWidth', 2);
+plot(t, rpm_model_on_meas, '--', 'LineWidth', 2);
+plot(t, rpm_setpoint, ':', 'LineWidth', 2);
 
 grid on;
 
 xlabel('Time [s]');
-ylabel('\omega [rad/s]');
+ylabel('Speed [rpm]');
 
-legend('Measured', 'Model');
+legend('Measured speed', 'Optimized model', 'Target speed');
 
-title('Real Motor vs Estimated Transfer Function');
+title('Post-Optimization Model vs Measured Speed');
 
 % ---------------------------------------------------------
 % DISPLAY RESULTS
@@ -354,12 +401,13 @@ fprintf('L = %.6e H\n', L);
 fprintf('J = %.6e kg.m^2\n', J);
 fprintf('b = %.6e N.m.s/rad\n', b);
 fprintf('K = %.6f V.s/rad (back-EMF constant)\n', K);
+fprintf('\nFeedforward PWM for %.2f rpm = %d / 255\n', TARGET_SPEED_RPM, pwm_for_target);
 
 % Calculate fitness metrics
-fit_error = norm(y_model(1:length(omega)) - omega') / norm(omega);
-fprintf('\nFit quality: MSE = %.6e, RMSE = %.4f rad/s, Error = %.2f%%\n', ...
-    mean((y_model(1:length(omega)) - omega').^2), ...
-    sqrt(mean((y_model(1:length(omega)) - omega').^2)), ...
+fit_error = norm(rpm_model_on_meas - rpm_meas') / norm(rpm_meas);
+fprintf('\nFit quality: MSE = %.6e, RMSE = %.4f rpm, Error = %.2f%%\n', ...
+    mean((rpm_model_on_meas - rpm_meas').^2), ...
+    sqrt(mean((rpm_model_on_meas - rpm_meas').^2)), ...
     fit_error*100);
 
 % Display motor time constants
