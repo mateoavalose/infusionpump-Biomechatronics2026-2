@@ -56,7 +56,9 @@ static constexpr int   CURRENT_SAMPLES   =   10;
 // ─────────────────────────────────────────────
 static constexpr float    PULSES_PER_MOTOR_REV  =   11.0f;
 static constexpr float    GEAR_RATIO            =  472.7272f;
-static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
+// How many encoder edges we count per encoder pulse. Use 2 when ISR uses CHANGE
+static constexpr int      ENC_EDGES_PER_PULSE   = 2; // 1 = rising only, 2 = both edges (CHANGE)
+static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO * ENC_EDGES_PER_PULSE; // effective counts per output rev
 
 static constexpr uint32_t RPM_WINDOW_MS         = 10;  // Window for RPM averaging — match telemetry for smoother updates
 
@@ -404,6 +406,10 @@ void printHelp() {
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
   Serial.println(F("║  Telemetry every 10 ms | RPM window: 10 ms     ║"));
-  Serial.println(F("║  Gear ratio 1:472.73 → 5200 pulses/output rev  ║"));
+  {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "║  Gear ratio 1:472.73 → %.0f counts/output rev  ║", PULSES_PER_OUTPUT_REV);
+    Serial.println(buf);
+  }
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }

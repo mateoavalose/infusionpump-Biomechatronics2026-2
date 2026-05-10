@@ -27,8 +27,8 @@ disp("Connected to ESP32");
 % USER PARAMETERS
 % ---------------------------------------------------------
 
-TARGET_SPEED_RPM = 3.0;   % desired speed setpoint shown in plots
-TEST_TIME        = 60;     % seconds (need >=2s for motor to fully settle + capture dynamics)
+TARGET_SPEED_RPM = 6.0;   % desired speed setpoint shown in plots
+TEST_TIME        = 5;     % seconds (need >=2s for motor to fully settle + capture dynamics)
 SUPPLY_VOLT      = 12.0;  % motor supply voltage
 
 % TELEMETRY CONFIG — must match ESP32 main.cpp
