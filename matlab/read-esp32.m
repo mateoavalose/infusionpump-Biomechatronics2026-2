@@ -27,7 +27,7 @@ disp('ESP32 Connected');
 % USER PARAMETERS
 % ---------------------------------------------------------
 
-TARGET_SPEED_RPM = 3.0;   % desired speed setpoint shown in plots
+TARGET_SPEED_RPM = 6.0;   % desired speed setpoint shown in plots
 TEST_TIME        = 3;     % seconds
 SUPPLY_VOLT      = 12.0;  % motor supply voltage
 
@@ -250,9 +250,7 @@ fprintf('Measured steady-state speed = %.3f rpm\n', rpm_ss_meas);
 % =========================================================
 
 disp(' ');
-disp('========================================');
 disp('STARTING MOTOR PARAMETER IDENTIFICATION');
-disp('========================================');
 
 % ---------------------------------------------------------
 % FIXED PARAMETER
@@ -411,13 +409,13 @@ legend( ...
 % ---------------------------------------------------------
 
 disp(' ');
-disp('=========== IDENTIFIED PARAMETERS ===========');
+disp(' IDENTIFIED PARAMETERS ');
 
 fprintf('R = %.6f Ohm\n', R);
-fprintf('L = %.6e H\n', L);
-fprintf('J = %.6e kg.m^2\n', J);
 fprintf('K = %.6f V.s/rad\n', K);
 fprintf('b = %.6e N.m.s/rad\n', b);
+fprintf('L = %.6e H\n', L);
+fprintf('J = %.6e kg.m^2\n', J);
 fprintf('Gear ratio used in model = %.3f\n', gearRatio);
 
 fprintf('\nRMSE = %.6f rpm\n', rmse);
