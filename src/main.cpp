@@ -42,12 +42,11 @@
 //    A = (2500 - mV_sensor) / 180
 //      = (2500 - mV_adc × 2) / 180
 // ─────────────────────────────────────────────
-static constexpr float ACS712_ZERO_MV    = 2500.0f; // Sensor zero-current output (mV)
-static constexpr float ACS712_SENS_MV_A  =  180.0f; // Sensitivity magnitude (mV/A)
-static constexpr float DIVIDER_RATIO     =    2.0f;  // Voltage divider ratio (10k+10k)
-static constexpr float ADC_REF_MV        = 3300.0f;  // ESP32 ADC reference (mV)
-static constexpr float ADC_RESOLUTION    = 4095.0f;  // 12-bit
-static constexpr int   CURRENT_SAMPLES   =   30;
+static constexpr float ACS712_ZERO_ADC_MV   = 1260.0f; // mV at ADC pin corresponding to zero current
+static constexpr float ACS712_SENS_MV_A     =  97.04f; // Sensitivity magnitude at sensor output (mV/A)
+static constexpr float ADC_REF_MV           = 3300.0f; // ESP32 ADC reference (mV)
+static constexpr float ADC_RESOLUTION       = 4095.0f; // 12-bit
+static constexpr int   CURRENT_SAMPLES     =   5;
 
 // ─────────────────────────────────────────────
 //  ENCODER & GEARBOX CONSTANTS
@@ -290,7 +289,6 @@ void processCommand(const String& raw) {
 
 // ═════════════════════════════════════════════
 //  MOTOR CONTROL
-//  Uses ledcWrite() instead of analogWrite()
 // ═════════════════════════════════════════════
 void applyMotor() {
   if (!motor.running || motor.pwm == 0) { stopMotor(); return; }
@@ -310,27 +308,31 @@ void stopMotor() {
   ledcWrite(LEDC_CHANNEL, 0);
 }
 
-// ═════════════════════════════════════════════
-//  CURRENT SENSING
-//
-//  ADC reads voltage at the divider midpoint (mV_adc = mV_sensor / 2).
-//  Reconstruct sensor voltage then apply ACS712 formula:
-//    A = (2500 - mV_sensor) / 180
-//
-//  Note: ESP32 ADC has known non-linearity near 0V and 3.3V rails.
-//  For higher accuracy in a future revision, use analogReadMilliVolts()
-//  (available in ESP-IDF / Arduino-ESP32 ≥ v2.0) with ADC calibration.
-// ═════════════════════════════════════════════
-float readCurrentAmps() {
+float readADC() {
   long sum = 0;
   for (int i = 0; i < CURRENT_SAMPLES; i++) {
     sum += analogRead(PIN_CURRENT);
-    delayMicroseconds(250);
+    delayMicroseconds(50);
   }
   float avgADC    = (float)sum / CURRENT_SAMPLES;
-  float adcMV     = (avgADC / ADC_RESOLUTION) * ADC_REF_MV;   // mV at ADC pin
-  float sensorMV  = adcMV * DIVIDER_RATIO;                     // reconstruct full sensor output
-  return (ACS712_ZERO_MV - sensorMV) / ACS712_SENS_MV_A;
+  return ((avgADC / ADC_RESOLUTION) * ADC_REF_MV);
+}
+
+// ═════════════════════════════════════════════
+//  CURRENT SENSING (ACS712 with voltage divider)
+//
+//  ACS712 at 5V supply outputs:
+//    - Zero current: 2500 mV
+//    - Sensitivity: ±180 mV/A
+//    - Formula: I_sensed = (V_out - 2500) / 180
+//
+//  Voltage divider (10k+10k) halves the output:
+//    - V_adc = V_out / 2
+//    - At zero current: V_adc = 1250 mV
+// ═════════════════════════════════════════════
+float readCurrentAmps() {
+  float adcMV   = readADC();
+  return (ACS712_ZERO_ADC_MV - adcMV) / ACS712_SENS_MV_A;
 }
 
 // ═════════════════════════════════════════════
@@ -342,7 +344,9 @@ void printTelemetry(float amps) {
   portEXIT_CRITICAL(&encoderMux);
   float outputRevs = (float)p / PULSES_PER_OUTPUT_REV;
 
-  Serial.print(F("[TEL] I="));
+  Serial.print(F("[TEL] ADC (mV) ="));
+  Serial.print(readADC());
+  Serial.print(F(" | I="));
   Serial.print(amps, 3);
   Serial.print(F(" A | PWM="));
   Serial.print(motor.pwm);
