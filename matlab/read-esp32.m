@@ -21,13 +21,13 @@ flush(s);
 
 pause(2);
 
-disp("Connected to ESP32");
+disp('ESP32 Connected');
 
 %% ---------------------------------------------------------
 % USER PARAMETERS
 % ---------------------------------------------------------
 
-TARGET_SPEED_RPM = 1.0;   % desired speed setpoint shown in plots
+TARGET_SPEED_RPM = 3.0;   % desired speed setpoint shown in plots
 TEST_TIME        = 3;     % seconds
 SUPPLY_VOLT      = 12.0;  % motor supply voltage
 
@@ -35,14 +35,16 @@ TELEMETRY_MS     = 10;    % Sampling interval in milliseconds (must match ESP32)
 
 PWM_PER_RPM_EST  = 40.0; % Open-loop feedforward guess used to convert speed setpoint into PWM.
 PWM_STEP         = min(max(round(TARGET_SPEED_RPM * PWM_PER_RPM_EST), 1), 255);
-
+disp(' ');
+disp('USER PARAMETERS');
 fprintf('Target speed setpoint = %.2f rpm\n', TARGET_SPEED_RPM);
 fprintf('Initial feedforward PWM command = %d\n', PWM_STEP);
 
 %% ---------------------------------------------------------
-% RESET MOTOR
+% EXPERIMENTAL MEASUREMENT
 % ---------------------------------------------------------
 
+% RESET MOTOR
 writeline(s, "STOP");
 pause(1);
 
@@ -53,7 +55,8 @@ pause(0.5);
 % START STEP RESPONSE TEST
 % ---------------------------------------------------------
 
-disp("Starting speed-setpoint test...");
+disp(' ');
+disp('STARTING SPEED SETPOINT TEST');
 
 writeline(s, sprintf("S %d", PWM_STEP));
 pause(0.1);
@@ -120,44 +123,57 @@ end
 
 writeline(s, "STOP");
 
-disp("Test completed.");
+disp(' ');
+disp('TEST COMPLETED');
 
 % ---------------------------------------------------------
-% CLEAN TIME VECTOR & ALIGN TO STEP
+% CLEAN TIME VECTOR & CROP TO TEST WINDOW
 % ---------------------------------------------------------
 
-t = t - t(1);  % Start from t=0 relative to first data point
+if isempty(t)
+    error('No telemetry data acquired. Check serial link and test duration.');
+end
 
-% If STEP_APPLIED marker was received, re-align so t=0 is step application
+% Define reference at acquisition start first, then crop using STEP_APPLIED
+t = t - t(1);
+
 if ~isempty(step_applied_idx) && step_applied_idx > 0 && step_applied_idx <= length(t)
     t_step = t(step_applied_idx);
-    t = t - t_step;  % New t=0 is at step application
-    disp(sprintf('[MATLAB] Time re-aligned: Step occurred at %.4f s after first sample', t_step));
-    % Remove pre-step data (optional: keep it for diagnostics)
-    % t(1:step_applied_idx-1) = [];
-    % pwm(1:step_applied_idx-1)% Remove pre-step data (op = [];
-    % ... etc
+    disp(sprintf('[MATLAB] STEP_APPLIED marker detected at t=%.4f s (acquisition reference).', t_step));
 else
-    disp('[MATLAB] No STEP_APPLIED marker detected. Using first data point as t=0.');
+    t_step = 0;
+    disp('[MATLAB] No STEP_APPLIED marker detected. Falling back to acquisition start as crop reference.');
 end
+
+% Keep only samples in [STEP_APPLIED, STEP_APPLIED + TEST_TIME]
+window_start = t_step;
+window_end   = t_step + TEST_TIME;
+valid_idx = (t >= window_start) & (t <= window_end);
+t       = t(valid_idx);
+pwm     = pwm(valid_idx);
+dirc    = dirc(valid_idx);
+pulses  = pulses(valid_idx);
+rpm     = rpm(valid_idx);
+omega   = omega(valid_idx);
+current = current(valid_idx);
+
+if numel(t) < 2
+    error('Not enough samples left after cropping to [STEP_APPLIED, STEP_APPLIED + TEST_TIME]. Increase TEST_TIME or telemetry rate.');
+end
+
+% Re-base time so t=0 is exactly STEP_APPLIED
+t = t - window_start;
 
 % Convert speed to rpm for plotting and setpoint comparison
 rpm_meas = omega * 60.0 / (2.0 * pi);
 rpm_setpoint = TARGET_SPEED_RPM * ones(size(t));
 
-% Crop to start near t=0 (remove pre-step data if any)
-t_min = -0.1;  % Start plots at t=-0.1 if available, else t=0
-crop_idx = find(t >= t_min);
-if isempty(crop_idx)
-    crop_idx = 1:length(t);
-else
-    crop_idx = crop_idx(1):length(t);
-end
-t_plot = t(crop_idx);
-rpm_meas_plot = rpm_meas(crop_idx);
-rpm_setpoint_plot = rpm_setpoint(crop_idx);
-omega_plot = omega(crop_idx);
-current_plot = current(crop_idx);
+% Plot vectors now already cropped to acquisition window [0, TEST_TIME]
+t_plot = t;
+rpm_meas_plot = rpm_meas;
+rpm_setpoint_plot = rpm_setpoint;
+omega_plot = omega;
+current_plot = current;
 
 % ---------------------------------------------------------
 % PLOT MEASURED RESPONSE VS SPEED SETPOINT
@@ -211,18 +227,6 @@ disp("Steady-state omega:");
 disp(omega_ss);
 
 % ---------------------------------------------------------
-% ESTIMATE 63% TIME CONSTANT
-% ---------------------------------------------------------
-
-omega63 = 0.632 * omega_ss;
-
-idx63 = find(omega >= omega63, 1);
-
-tau_est = t(idx63);
-
-fprintf('\nEstimated tau = %.4f s\n', tau_est);
-
-% ---------------------------------------------------------
 % ESTIMATE RISE + SETTLING TIME
 % ---------------------------------------------------------
 
@@ -241,104 +245,52 @@ fprintf('\nEstimated input voltage = %.3f V\n', Va);
 rpm_ss_meas = omega_ss * 60.0 / (2.0 * pi);
 fprintf('Measured steady-state speed = %.3f rpm\n', rpm_ss_meas);
 
-%% ---------------------------------------------------------
-% INITIAL PARAMETER ESTIMATES
-% ---------------------------------------------------------
+%% =========================================================
+% MOTOR PARAMETER IDENTIFICATION
+% =========================================================
 
-% Estimate R from initial transient (when omega ≈ 0, back-EMF ≈ 0)
-% Use first ~50-100ms where di/dt is large but speed hasn't accelerated much
-initial_window = min(10, length(current));  % First 10 samples (~200ms)
-initial_idx = find(current(1:initial_window) > max(current(1:initial_window))*0.3, 1);
-if isempty(initial_idx); initial_idx = 1; end
-R0 = Va / mean(current(initial_idx:min(initial_idx+5, length(current))));
-
-% K from steady state is solid
-K0 = omega_ss / Va;
-
-% Better J/b estimation: use initial acceleration
-% At startup: dω/dt ≈ K*i_initial / J (since ω≈0 and b*ω ≈ 0)
-accel_window = min(50, length(omega));
-accel_initial = gradient(omega(1:accel_window)) / (TELEMETRY_MS/1000);
-i_start = mean(current(1:min(10, length(current))));
-J0 = max((K0 * i_start) / mean(accel_initial(accel_initial > 0)), 1e-6);
-
-% Damping from steady-state equilibrium: K*i_ss = b*omega_ss + friction
-% Estimate b from steady-state current and speed
-i_ss = mean(current(end-20:end));
-b0 = max(K0 * i_ss / max(omega_ss, 0.1), 0.001);
-
-% Typical motor inductance 0.5-2 mH
-L0 = 8e-4;
-
-x0 = [L0 J0 K0 b0];
-
-fprintf('\nInitial guesses:\n');
-fprintf('R = %.6f Ohm\n', R0);
-fprintf('L = %.6f H\n', L0);
-fprintf('J = %.6e kg.m^2\n', J0);
-fprintf('K = %.6f V.s/rad\n', K0);
-fprintf('b = %.6e N.m.s/rad\n', b0);
-
-%% ---------------------------------------------------------
-% PARAMETER BOUNDS (Adjusted for realistic motor parameters)
-% ---------------------------------------------------------
-
-lb = [1e-5   1e-7   0.01   1e-6];   % L, J, K, b lower bounds
-ub = [10     1e-2   100    1];      % L, J, K, b upper bounds
-
-fprintf('\nBounds:\n');
-fprintf('L: [%.2e, %.2e] H\n', lb(1), ub(1));
-fprintf('J: [%.2e, %.2e] kg.m^2\n', lb(2), ub(2));
-fprintf('K: [%.4f, %.4f] V.s/rad\n', lb(3), ub(3));
-fprintf('b: [%.2e, %.2e] N.m.s/rad\n', lb(4), ub(4));
-
-%% ---------------------------------------------------------
-% MANUAL PARAMETER OVERRIDE
-% ---------------------------------------------------------
-% You can optionally override the estimated parameters here and inspect
-% the model response BEFORE running the optimization.
-
-R_manual = 27.4;         % Ohms
-K_manual = 0.0404;       % N.m/A
-b_manual = 1.6321952e-6; % N.m.s
-L_manual = 1e-3;         % Henry
-J_manual = 1e-4;         % kg.m^2
-
-% Use estimated values by default
-%R_manual = R0;
-%L_manual = L0;
-%J_manual = J0;
-%K_manual = K0;
-%b_manual = b0;
-
-fprintf('\n========== MANUAL PARAMETERS FOR PRE-OPTIMIZATION PLOT ==========\n');
-fprintf('R = %.6f Ohm\n', R_manual);
-fprintf('L = %.6f H\n', L_manual);
-fprintf('J = %.6e kg.m^2\n', J_manual);
-fprintf('K = %.6f V.s/rad\n', K_manual);
-fprintf('b = %.6e N.m.s/rad\n', b_manual);
+disp(' ');
+disp('========================================');
+disp('STARTING MOTOR PARAMETER IDENTIFICATION');
+disp('========================================');
 
 % ---------------------------------------------------------
-% PLOT MANUAL TF RESPONSE BEFORE OPTIMIZATION
+% FIXED PARAMETER
 % ---------------------------------------------------------
 
-s_tf = tf('s');
-G_manual = K_manual / ((J_manual*s_tf + b_manual)*(L_manual*s_tf + R_manual) + K_manual^2);
-[y_manual, t_manual] = step(Va * G_manual, t(end));
-rpm_manual = y_manual * 60.0 / (2.0 * pi);
-rpm_manual_on_plot = interp1(t_manual, rpm_manual, t_plot, 'linear', 'extrap');
+R0 = 27.4;     % Measured armature resistance [Ohm]
+gearRatio = 472.7272; % Encoder gearbox ratio
 
-figure;
-plot(t_plot, rpm_meas_plot, 'LineWidth', 2);
-hold on;
-plot(t_plot, rpm_manual_on_plot, '--', 'LineWidth', 2);
-plot(t_plot, rpm_setpoint_plot, ':', 'LineWidth', 2);
-grid on;
+% ---------------------------------------------------------
+% INITIAL GUESS
+%
+% x = [L J K b]
+% ---------------------------------------------------------
 
-xlabel('Time [s]');
-ylabel('Speed [rpm]');
-title('Pre-Optimization: Manual TF vs Measured Speed');
-legend('Measured speed', 'Manual model', 'Target speed');
+x0 = [
+    1e-3      % L [H]
+    1e-5      % J [kg.m^2]
+    0.04      % K [V.s/rad]
+    1e-5      % b [N.m.s/rad]
+];
+
+% ---------------------------------------------------------
+% PARAMETER BOUNDS
+% ---------------------------------------------------------
+
+lb = [
+    1e-6      % L
+    1e-8      % J
+    1e-4      % K
+    1e-8      % b
+];
+
+ub = [
+    1         % L
+    1e-2      % J
+    1         % K
+    1         % b
+];
 
 % ---------------------------------------------------------
 % COST FUNCTION
@@ -347,118 +299,148 @@ legend('Measured speed', 'Manual model', 'Target speed');
 costFun = @(x) motorCost(x, R0, t, omega, Va);
 
 % ---------------------------------------------------------
-% OPTIMIZATION
+% OPTIMIZATION OPTIONS
 % ---------------------------------------------------------
 
-disp("Running optimization...");
+opts = optimoptions( ...
+    'fmincon', ...
+    'Display', 'iter', ...
+    'MaxFunctionEvaluations', 5000, ...
+    'MaxIterations', 1000);
 
-% Validate measured data before optimization
-if length(t) < 10 || length(omega) < 10
-    warning('Not enough data points for reliable optimization (need >=10). Skipping optimization.');
-    xopt = x0;
-else
-    % Evaluate cost at initial guess to ensure objective is defined
-    cost0 = costFun(x0);
-    if ~isfinite(cost0) || cost0 > 1e11
-        warning('Initial cost is invalid (%.3e). Replacing initial guess with safe defaults.', cost0);
-        x0 = [1e-3, 1e-4, max(K0,0.01), 1e-3];
-        cost0 = costFun(x0);
-    end
+% ---------------------------------------------------------
+% RUN OPTIMIZATION
+% ---------------------------------------------------------
 
-    if ~isfinite(cost0) || cost0 > 1e11
-        warning('Cost at fallback initial guess still invalid. Skipping optimization and using fallback parameters.');
-        xopt = x0;
-    else
-        try
-            opts = optimoptions('fmincon','Display','iter','MaxFunctionEvaluations',2000);
-            xopt = fmincon(costFun, x0, [], [], [], [], lb, ub, [], opts);
-        catch ME
-            warning('fmincon failed: %s\nUsing initial guess as solution.', ME.message);
-            xopt = x0;
-        end
-    end
-end
+disp('Running optimization...');
+
+xopt = fmincon( ...
+    costFun, ...
+    x0, ...
+    [], [], [], [], ...
+    lb, ub, ...
+    [], ...
+    opts);
+
+% ---------------------------------------------------------
+% EXTRACT PARAMETERS
+% ---------------------------------------------------------
 
 L = xopt(1);
 J = xopt(2);
 K = xopt(3);
 b = xopt(4);
+
 R = R0;
 
 % ---------------------------------------------------------
 % BUILD TRANSFER FUNCTION
 % ---------------------------------------------------------
 
-G = K / ((J*s_tf + b)*(L*s_tf + R) + K^2);
+s = tf('s');
 
-%% ---------------------------------------------------------
+G = (K / gearRatio) / ((J*s + b)*(L*s + R) + K^2);
+
+% ---------------------------------------------------------
 % SIMULATE MODEL
 % ---------------------------------------------------------
 
-[y_model, t_model] = step(Va * G, t(end));
+% Use a uniform simulation grid because `step` requires evenly spaced times.
+% The measurement timestamps come from serial reception and are not uniform.
+t_meas = t(:);
+if numel(t_meas) < 2
+    error('Not enough time samples to simulate the model.');
+end
 
-rpm_model = y_model * 60.0 / (2.0 * pi);
-rpm_model_on_plot = interp1(t_model, rpm_model, t_plot, 'linear', 'extrap');
+dt_meas = median(diff(t_meas));
+if ~isfinite(dt_meas) || dt_meas <= 0
+    error('Invalid time vector spacing detected.');
+end
 
-% Feedforward PWM required by the optimized model to reach the target speed.
-dc_gain = K / (b * R + K^2);
-omega_target = TARGET_SPEED_RPM * (2.0 * pi / 60.0);
-va_for_target = omega_target / max(dc_gain, eps);
-pwm_for_target = min(max(round((va_for_target / SUPPLY_VOLT) * 255.0), 1), 255);
+t_sim = (0:dt_meas:t_meas(end)).';
+if numel(t_sim) < 2
+    t_sim = linspace(0, t_meas(end), 2).';
+end
+
+[y_model, t_model] = step(Va * G, t_sim);
+
+y_model = squeeze(y_model);
+
+rpm_model = interp1(t_model, y_model * 60/(2*pi), t_meas, 'linear', 'extrap');
+
+rpm_meas = omega(:) * 60/(2*pi);
+rpm_model = rpm_model(:);
 
 % ---------------------------------------------------------
-% COMPARE MODEL VS REAL
+% FIT QUALITY
+% ---------------------------------------------------------
+
+rmse = sqrt(mean((rpm_model - rpm_meas).^2));
+
+fit_percent = 100 * ...
+    (1 - norm(rpm_model - rpm_meas) / max(norm(rpm_meas - mean(rpm_meas)), eps));
+
+%% ---------------------------------------------------------
+% PLOT COMPARISON
 % ---------------------------------------------------------
 
 figure;
 
-plot(t_plot, rpm_meas_plot, 'LineWidth', 2);
+plot(t_meas, rpm_meas, 'LineWidth', 2);
 hold on;
 
-plot(t_plot, rpm_model_on_plot, '--', 'LineWidth', 2);
-plot(t_plot, rpm_setpoint_plot, ':', 'LineWidth', 2);
+plot(t_meas, rpm_model, '--', 'LineWidth', 2);
+
+plot(t_meas, TARGET_SPEED_RPM * ones(size(t_meas)), ':', 'LineWidth', 2);
 
 grid on;
 
 xlabel('Time [s]');
 ylabel('Speed [rpm]');
 
-legend('Measured speed', 'Optimized model', 'Target speed');
+title('Measured vs Identified Motor Model');
 
-title('Post-Optimization: Optimized TF vs Measured Speed');
+legend( ...
+    'Measured', ...
+    'Identified Model', ...
+    'Target');
 
 % ---------------------------------------------------------
 % DISPLAY RESULTS
 % ---------------------------------------------------------
 
-disp(" ");
-disp("=========== IDENTIFIED MOTOR PARAMETERS ===========");
+disp(' ');
+disp('=========== IDENTIFIED PARAMETERS ===========');
 
 fprintf('R = %.6f Ohm\n', R);
 fprintf('L = %.6e H\n', L);
 fprintf('J = %.6e kg.m^2\n', J);
+fprintf('K = %.6f V.s/rad\n', K);
 fprintf('b = %.6e N.m.s/rad\n', b);
-fprintf('K = %.6f V.s/rad (back-EMF constant)\n', K);
-fprintf('\nFeedforward PWM for %.2f rpm = %d / 255\n', TARGET_SPEED_RPM, pwm_for_target);
+fprintf('Gear ratio used in model = %.3f\n', gearRatio);
 
-% Calculate fitness metrics
-fit_error = norm(rpm_model_on_plot - rpm_meas_plot') / norm(rpm_meas_plot);
-fprintf('\nFit quality: MSE = %.6e, RMSE = %.4f rpm, Error = %.2f%%\n', ...
-    mean((rpm_model_on_plot - rpm_meas_plot').^2), ...
-    sqrt(mean((rpm_model_on_plot - rpm_meas_plot').^2)), ...
-    fit_error*100);
+fprintf('\nRMSE = %.6f rpm\n', rmse);
+fprintf('Fit = %.2f %%\n', fit_percent);
 
-% Display motor time constants
+% ---------------------------------------------------------
+% TIME CONSTANTS
+% ---------------------------------------------------------
+
 tau_elec = L / R;
+
 tau_mech = J / b;
-tau_dominant = max(tau_elec, tau_mech);
 
-fprintf('\nDerived time constants:\n');
-fprintf('  Electrical: τ_L = L/R = %.6f s\n', tau_elec);
-fprintf('  Mechanical: τ_mech = J/b = %.6f s\n', tau_mech);
-fprintf('  Dominant time constant = %.6f s\n', tau_dominant);
+fprintf('\nElectrical tau = %.6f s\n', tau_elec);
+fprintf('Mechanical tau = %.6f s\n', tau_mech);
 
-disp(" ");
+% ---------------------------------------------------------
+% SHOW TF
+% ---------------------------------------------------------
+
+disp(' ');
+disp('Transfer Function:');
+
+G
 
 %% ---------------------------------------------------------
 % SAVE DATA

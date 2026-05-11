@@ -42,12 +42,11 @@
 //    A = (2500 - mV_sensor) / 180
 //      = (2500 - mV_adc × 2) / 180
 // ─────────────────────────────────────────────
-static constexpr float ACS712_ZERO_MV    = 2500.0f; // Sensor zero-current output (mV)
-static constexpr float ACS712_SENS_MV_A  =  180.0f; // Sensitivity magnitude (mV/A)
-static constexpr float DIVIDER_RATIO     =    2.0f;  // Voltage divider ratio (10k+10k)
+static constexpr float ACS712_ZERO_MV    = 1260.0f; // Sensor zero-current output (mV)
+static constexpr float ACS712_SENS_MV_A  =  97.04f; // Sensitivity magnitude (mV/A)
 static constexpr float ADC_REF_MV        = 3300.0f;  // ESP32 ADC reference (mV)
 static constexpr float ADC_RESOLUTION    = 4095.0f;  // 12-bit
-static constexpr int   CURRENT_SAMPLES   =   10;
+static constexpr int   CURRENT_SAMPLES   =   5;
 
 // ─────────────────────────────────────────────
 //  ENCODER & GEARBOX CONSTANTS
@@ -361,8 +360,7 @@ float readCurrentAmps() {
   }
   float avgADC    = (float)sum / CURRENT_SAMPLES;
   float adcMV     = (avgADC / ADC_RESOLUTION) * ADC_REF_MV;   // mV at ADC pin
-  float sensorMV  = adcMV * DIVIDER_RATIO;                     // reconstruct full sensor output
-  return (ACS712_ZERO_MV - sensorMV) / ACS712_SENS_MV_A;
+  return (ACS712_ZERO_MV - adcMV) / ACS712_SENS_MV_A;
 }
 
 // ═════════════════════════════════════════════
