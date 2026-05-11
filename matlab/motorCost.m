@@ -6,6 +6,7 @@ J = x(2);
 K = x(3);
 b = x(4);
 gearRatio = 472.7272;
+gain = 60 / (2*pi*gearRatio); % rad/s -> output rpm through gearbox
 
 % Reject invalid values
 if any(x <= 0)
@@ -20,8 +21,8 @@ try
     % Transfer function
     s = tf('s');
 
-    % Output-shaft speed model: divide motor speed by gearbox ratio.
-    G = (K / gearRatio) / ((J*s + b)*(L*s + R) + K^2);
+    % Motor-shaft speed model in rad/s/V.
+    G = K / ((J*s + b)*(L*s + R) + K^2);
 
     % Simulate on a uniform grid because `step` requires evenly spaced time.
     t_meas = t(:);
@@ -41,12 +42,12 @@ try
         t_sim = linspace(0, t_meas(end), 2).';
     end
 
-    y = step(Va * G, t_sim);
+    y = step(Va * gain * G, t_sim);
 
     y = squeeze(y);
 
-    % Convert to rpm
-    rpm_sim = interp1(t_sim, y * 60/(2*pi), t_meas, 'linear', 'extrap');
+    % Already in output rpm
+    rpm_sim = interp1(t_sim, y, t_meas, 'linear', 'extrap');
 
     rpm_meas = omega_meas * 60/(2*pi);
 

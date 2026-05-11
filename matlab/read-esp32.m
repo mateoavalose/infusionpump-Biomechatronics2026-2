@@ -260,6 +260,7 @@ disp('========================================');
 
 R0 = 27.4;     % Measured armature resistance [Ohm]
 gearRatio = 472.7272; % Encoder gearbox ratio
+gain = 60 / (2*pi*gearRatio); % Convert motor rad/s to output rpm after gearbox
 
 % ---------------------------------------------------------
 % INITIAL GUESS
@@ -339,7 +340,7 @@ R = R0;
 
 s = tf('s');
 
-G = (K / gearRatio) / ((J*s + b)*(L*s + R) + K^2);
+G = K / ((J*s + b)*(L*s + R) + K^2);
 
 % ---------------------------------------------------------
 % SIMULATE MODEL
@@ -362,11 +363,11 @@ if numel(t_sim) < 2
     t_sim = linspace(0, t_meas(end), 2).';
 end
 
-[y_model, t_model] = step(Va * G, t_sim);
+[y_model, t_model] = step(Va * gain * G, t_sim);
 
 y_model = squeeze(y_model);
 
-rpm_model = interp1(t_model, y_model * 60/(2*pi), t_meas, 'linear', 'extrap');
+rpm_model = interp1(t_model, y_model, t_meas, 'linear', 'extrap');
 
 rpm_meas = omega(:) * 60/(2*pi);
 rpm_model = rpm_model(:);
