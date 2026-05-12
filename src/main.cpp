@@ -8,8 +8,8 @@
 // ─────────────────────────────────────────────
 
 // TB6612FNG Motor Driver
-#define PIN_AIN1  25
-#define PIN_AIN2  26
+#define PIN_AIN1  26
+#define PIN_AIN2  25
 #define PIN_PWMA  27   // LEDC output
 #define PIN_STBY  14
 
