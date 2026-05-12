@@ -65,6 +65,8 @@ static constexpr uint32_t RPM_WINDOW_MS         = 1000;
 static constexpr uint32_t TELEMETRY_MS = 500;
 static uint32_t lastTelemetry          = 0;
 
+static constexpr float RAD_PER_SEC_TO_RPM = 60.0f / (2.0f * PI);
+
 // ─────────────────────────────────────────────
 //  MOTOR STATE
 // ─────────────────────────────────────────────
@@ -84,9 +86,9 @@ struct MotorState {
 // ─────────────────────────────────────────────
 volatile long encoderPulses = 0;
 
-long     rpmPulseSnapshot = 0;
-uint32_t rpmLastCalcMs    = 0;
-float    outputRPM        = 0.0f;
+long     speedPulseSnapshot = 0;
+uint32_t speedLastCalcMs    = 0;
+float    outputRadPerSec    = 0.0f;
 
 // FreeRTOS critical section handle (used instead of noInterrupts on ESP32)
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
@@ -98,7 +100,7 @@ void  applyMotor();
 void  stopMotor();
 float readCurrentAmps();
 void  processCommand(const String& raw);
-void  updateRPM();
+void  updateSpeedRadPerSec();
 void  printTelemetry(float amps);
 void  printHelp();
 void  IRAM_ATTR encoderISR();
@@ -152,7 +154,7 @@ void setup() {
   stopMotor();
   digitalWrite(PIN_STBY, HIGH);  // Release driver from standby
 
-  rpmLastCalcMs = millis();
+  speedLastCalcMs = millis();
   printHelp();
 }
 
@@ -162,7 +164,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  updateRPM();
+  updateSpeedRadPerSec();
 
   if (now - lastTelemetry >= TELEMETRY_MS) {
     lastTelemetry = now;
@@ -177,11 +179,11 @@ void loop() {
 }
 
 // ═════════════════════════════════════════════
-//  RPM CALCULATION
+//  SPEED CALCULATION
 // ═════════════════════════════════════════════
-void updateRPM() {
+void updateSpeedRadPerSec() {
   uint32_t now     = millis();
-  uint32_t elapsed = now - rpmLastCalcMs;
+  uint32_t elapsed = now - speedLastCalcMs;
   if (elapsed < RPM_WINDOW_MS) return;
 
   // FreeRTOS-safe read of volatile long from main-loop context
@@ -189,12 +191,13 @@ void updateRPM() {
   long currentPulses = encoderPulses;
   portEXIT_CRITICAL(&encoderMux);
 
-  long  deltaPulses = currentPulses - rpmPulseSnapshot;
-  float elapsedMin  = (float)elapsed / 60000.0f;
+  long  deltaPulses = currentPulses - speedPulseSnapshot;
+  float elapsedSec  = (float)elapsed / 1000.0f;
 
-  outputRPM        = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedMin;
-  rpmPulseSnapshot = currentPulses;
-  rpmLastCalcMs    = now;
+  float outputRevPerSec = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedSec;
+  outputRadPerSec       = outputRevPerSec * (2.0f * PI);
+  speedPulseSnapshot = currentPulses;
+  speedLastCalcMs    = now;
 }
 
 // ═════════════════════════════════════════════
@@ -250,15 +253,15 @@ void processCommand(const String& raw) {
     Serial.print(F(" | Output revs="));
     Serial.print(outputRevs, 5);
     Serial.print(F(" | RPM="));
-    Serial.println(outputRPM, 3);
+    Serial.println(outputRadPerSec * RAD_PER_SEC_TO_RPM, 3);
 
   // ── RESET — zero the encoder counter ────────
   } else if (cmd == F("RESET")) {
     portENTER_CRITICAL(&encoderMux);
     encoderPulses = 0;
     portEXIT_CRITICAL(&encoderMux);
-    rpmPulseSnapshot = 0;
-    outputRPM        = 0.0f;
+    speedPulseSnapshot = 0;
+    outputRadPerSec  = 0.0f;
     Serial.println(F("[OK] Encoder counter reset to 0"));
 
   // ── C / CURRENT — on-demand reading ─────────
@@ -359,7 +362,7 @@ void printTelemetry(float amps) {
   Serial.print(F(" | Revs="));
   Serial.print(outputRevs, 4);
   Serial.print(F(" | RPM="));
-  Serial.println(outputRPM, 2);
+  Serial.println(outputRadPerSec * RAD_PER_SEC_TO_RPM, 2);
 }
 
 void printHelp() {
