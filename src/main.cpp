@@ -57,7 +57,7 @@ static constexpr float    PULSES_PER_MOTOR_REV  =   11.0f;
 static constexpr float    GEAR_RATIO            =  472.7272f;
 static constexpr float    PULSES_PER_OUTPUT_REV =  PULSES_PER_MOTOR_REV * GEAR_RATIO; // 5200.0
 
-static constexpr uint32_t RPM_WINDOW_MS         = 1000;
+static constexpr uint32_t CONTROL_PERIOD_MS     = 20;
 
 // ─────────────────────────────────────────────
 //  TELEMETRY TIMING
@@ -66,6 +66,25 @@ static constexpr uint32_t TELEMETRY_MS = 500;
 static uint32_t lastTelemetry          = 0;
 
 static constexpr float RAD_PER_SEC_TO_RPM = 60.0f / (2.0f * PI);
+
+// PID gains from Simulink
+static constexpr float PID_KC = 134.345399f;
+static constexpr float PID_TI = 0.110091f;
+static constexpr float PID_TD = 0.036606f;
+
+// Back-calculation anti-windup gain.
+static const float PID_KB = 1.0f / sqrtf(PID_TI * PID_TD);
+
+static constexpr float PWM_MIN = 0.0f;
+static constexpr float PWM_MAX = 255.0f;
+
+struct PIDState {
+  float setpointRadPerSec = 0.0f;
+  float integrator        = 0.0f;
+  float prevMeasurement   = 0.0f;
+  bool  enabled           = false;
+  uint32_t lastUpdateMs   = 0;
+} pid;
 
 // ─────────────────────────────────────────────
 //  MOTOR STATE
@@ -101,6 +120,9 @@ void  stopMotor();
 float readCurrentAmps();
 void  processCommand(const String& raw);
 void  updateSpeedRadPerSec();
+void  updatePidControl();
+float clampf(float value, float lowerBound, float upperBound);
+void  resetPidState();
 void  printTelemetry(float amps);
 void  printHelp();
 void  IRAM_ATTR encoderISR();
@@ -155,6 +177,7 @@ void setup() {
   digitalWrite(PIN_STBY, HIGH);  // Release driver from standby
 
   speedLastCalcMs = millis();
+  resetPidState();
   printHelp();
 }
 
@@ -165,6 +188,7 @@ void loop() {
   uint32_t now = millis();
 
   updateSpeedRadPerSec();
+  updatePidControl();
 
   if (now - lastTelemetry >= TELEMETRY_MS) {
     lastTelemetry = now;
@@ -184,7 +208,7 @@ void loop() {
 void updateSpeedRadPerSec() {
   uint32_t now     = millis();
   uint32_t elapsed = now - speedLastCalcMs;
-  if (elapsed < RPM_WINDOW_MS) return;
+  if (elapsed < CONTROL_PERIOD_MS) return;
 
   // FreeRTOS-safe read of volatile long from main-loop context
   portENTER_CRITICAL(&encoderMux);
@@ -198,6 +222,44 @@ void updateSpeedRadPerSec() {
   outputRadPerSec       = outputRevPerSec * (2.0f * PI);
   speedPulseSnapshot = currentPulses;
   speedLastCalcMs    = now;
+}
+
+void updatePidControl() {
+  if (!pid.enabled) return;
+
+  uint32_t now = millis();
+  uint32_t elapsed = now - pid.lastUpdateMs;
+  if (elapsed < CONTROL_PERIOD_MS) return;
+
+  float dt = (float)elapsed / 1000.0f;
+
+  float error = pid.setpointRadPerSec - outputRadPerSec;
+
+  float proportional = PID_KC * error;
+  float derivative    = -PID_KC * PID_TD * ((outputRadPerSec - pid.prevMeasurement) / dt);
+  float unsatOutput   = proportional + pid.integrator + derivative;
+  float satOutput     = clampf(unsatOutput, -PWM_MAX, PWM_MAX);
+
+  pid.integrator += dt * ((PID_KC / PID_TI) * error + PID_KB * (satOutput - unsatOutput));
+  pid.prevMeasurement = outputRadPerSec;
+  pid.lastUpdateMs = now;
+
+  motor.forward = (satOutput >= 0.0f);
+  motor.pwm = (uint8_t)clampf(fabsf(satOutput), PWM_MIN, PWM_MAX);
+  motor.running = true;
+  applyMotor();
+}
+
+float clampf(float value, float lowerBound, float upperBound) {
+  if (value < lowerBound) return lowerBound;
+  if (value > upperBound) return upperBound;
+  return value;
+}
+
+void resetPidState() {
+  pid.integrator = 0.0f;
+  pid.prevMeasurement = outputRadPerSec;
+  pid.lastUpdateMs = millis();
 }
 
 // ═════════════════════════════════════════════
@@ -214,9 +276,27 @@ void processCommand(const String& raw) {
     if (motor.running) applyMotor();
     Serial.print(F("[OK] PWM set to "));
     Serial.print(motor.pwm);
-    Serial.print(F("/255  (~"));
-    Serial.print((motor.pwm / 255.0f) * 6.0f, 2);
-    Serial.println(F(" RPM estimated)"));
+    Serial.println(F("/255 (manual mode)"));
+
+  // ── SP <rad/s> / SET <rad/s> ────────────────
+  } else if (cmd.startsWith(F("SP ")) || cmd.startsWith(F("SET "))) {
+    float target = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
+    pid.setpointRadPerSec = target;
+    Serial.print(F("[OK] Setpoint set to "));
+    Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 3);
+    Serial.println(F(" RPM"));
+
+  // ── PID ON / OFF ────────────────────────────
+  } else if (cmd == F("PID ON")) {
+    pid.enabled = true;
+    motor.running = true;
+    resetPidState();
+    applyMotor();
+    Serial.println(F("[OK] PID enabled"));
+  } else if (cmd == F("PID OFF")) {
+    pid.enabled = false;
+    stopMotor();
+    Serial.println(F("[OK] PID disabled"));
 
   // ── F / FWD ─────────────────────────────────
   } else if (cmd == F("F") || cmd == F("FWD") || cmd == F("FORWARD")) {
@@ -233,13 +313,16 @@ void processCommand(const String& raw) {
   // ── GO / START ───────────────────────────────
   } else if (cmd == F("GO") || cmd == F("START")) {
     motor.running = true;
+    if (pid.enabled) resetPidState();
     applyMotor();
     Serial.println(F("[OK] Motor started"));
 
   // ── STOP / X ────────────────────────────────
   } else if (cmd == F("STOP") || cmd == F("X")) {
     motor.running = false;
+    pid.enabled = false;
     stopMotor();
+    resetPidState();
     Serial.println(F("[OK] Motor stopped (coast)"));
 
   // ── ENC — on-demand encoder snapshot ────────
@@ -357,6 +440,10 @@ void printTelemetry(float amps) {
   Serial.print(motor.forward ? F("FWD") : F("REV"));
   Serial.print(F(" | Motor="));
   Serial.print(motor.running ? F("ON ") : F("OFF"));
+  Serial.print(F(" | PID="));
+  Serial.print(pid.enabled ? F("ON") : F("OFF"));
+  Serial.print(F(" | SP RPM="));
+  Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 2);
   Serial.print(F(" | Pulses="));
   Serial.print(p);
   Serial.print(F(" | Revs="));
@@ -370,6 +457,8 @@ void printHelp() {
   Serial.println(F("║  Infusion Pump — ESP32 Open Loop + Encoder     ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
   Serial.println(F("║  S <0-255>    Set PWM speed                    ║"));
+  Serial.println(F("║  SP <rad/s>   Set PID speed setpoint           ║"));
+  Serial.println(F("║  PID ON/OFF   Enable / disable PID control      ║"));
   Serial.println(F("║  F / FWD      Direction → Forward              ║"));
   Serial.println(F("║  R / REV      Direction → Reverse              ║"));
   Serial.println(F("║  GO / START   Start motor                      ║"));
@@ -380,7 +469,7 @@ void printHelp() {
   Serial.println(F("║  STBY ON/OFF  Enable / disable driver          ║"));
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
-  Serial.println(F("║  Telemetry every 500 ms | RPM window: 1000 ms  ║"));
+  Serial.println(F("║  Telemetry every 500 ms | control: 20 ms       ║"));
   Serial.println(F("║  Gear ratio 1:472.73 → 5200 pulses/output rev  ║"));
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }
