@@ -72,6 +72,12 @@ static constexpr float PWM_MIN = 0.0f;
 static constexpr float PWM_MAX = 255.0f;
 
 static constexpr uint32_t CONTROL_PERIOD_MS = 50;
+static constexpr uint32_t CURRENT_CHECK_MS = 20;
+static constexpr uint32_t CURRENT_FAULT_ARM_MS = 300;
+static constexpr uint32_t CURRENT_FAULT_TRIP_MS = 250;
+static constexpr float    CURRENT_FAULT_PERCENT = 0.30f;
+static constexpr float    CURRENT_FAULT_BASELINE_ALPHA = 0.02f;
+static constexpr float    CURRENT_FAULT_MIN_BASELINE_A = 0.05f;
 
 enum class ControlMode {
   Manual,
@@ -102,6 +108,18 @@ struct SSState {
   uint32_t lastUpdateMs   = 0;
 } ss;
 
+struct CurrentFaultState {
+  float baselineAmps = 0.0f;
+  uint32_t motorStartMs = 0;
+  uint32_t overThresholdSinceMs = 0;
+  bool baselineValid = false;
+  bool armed = false;
+  bool latched = false;
+  float thresholdPercent = CURRENT_FAULT_PERCENT;
+  uint32_t armDelayMs = CURRENT_FAULT_ARM_MS;
+  uint32_t tripDelayMs = CURRENT_FAULT_TRIP_MS;
+} currentFault;
+
 ControlMode controlMode = ControlMode::Manual;
 
 volatile long encoderPulses = 0;
@@ -112,6 +130,7 @@ float    outputRadPerSec    = 0.0f;
 
 bool matlabReadableOutput = true;
 bool stepMarkerPending    = false;
+uint32_t lastCurrentCheckMs = 0;
 
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -126,9 +145,13 @@ void  processCommand(const String& raw);
 void  updateSpeedRadPerSec();
 void  updatePidControl();
 void  updateSsControl();
+void  updateCurrentFaultMonitor(float amps);
 float clampf(float value, float lowerBound, float upperBound);
 void  resetPidState();
 void  resetSsState();
+void  resetCurrentFaultState();
+void  armCurrentFaultMonitor();
+void  tripCurrentFault(const __FlashStringHelper* reason);
 void  setControlMode(ControlMode mode);
 const __FlashStringHelper* controlModeName();
 void  printTelemetry(float amps);
@@ -172,6 +195,7 @@ void setup() {
 
   speedLastCalcMs = millis();
   resetPidState();
+  resetCurrentFaultState();
   printHelp();
 }
 
@@ -182,6 +206,11 @@ void loop() {
   uint32_t now = millis();
 
   updateSpeedRadPerSec();
+  if ((now - lastCurrentCheckMs) >= CURRENT_CHECK_MS) {
+    lastCurrentCheckMs = now;
+    float amps = readCurrentAmps();
+    updateCurrentFaultMonitor(amps);
+  }
   if (controlMode == ControlMode::PID) {
     updatePidControl();
   } else if (controlMode == ControlMode::SS) {
@@ -279,6 +308,47 @@ void updateSsControl() {
   applyMotor();
 }
 
+void updateCurrentFaultMonitor(float amps) {
+  uint32_t now = millis();
+
+  if (!motor.running || currentFault.latched) {
+    currentFault.overThresholdSinceMs = 0;
+    return;
+  }
+
+  if (!currentFault.armed) {
+    if ((now - currentFault.motorStartMs) >= currentFault.armDelayMs) {
+      currentFault.armed = true;
+      currentFault.baselineAmps = fabsf(amps);
+      currentFault.baselineValid = true;
+    } else {
+      return;
+    }
+  }
+
+  float absAmps = fabsf(amps);
+  if (!currentFault.baselineValid) {
+    currentFault.baselineAmps = absAmps;
+    currentFault.baselineValid = true;
+  } else {
+    currentFault.baselineAmps = (CURRENT_FAULT_BASELINE_ALPHA * absAmps)
+                              + ((1.0f - CURRENT_FAULT_BASELINE_ALPHA) * currentFault.baselineAmps);
+  }
+
+  float referenceBaseline = clampf(currentFault.baselineAmps, CURRENT_FAULT_MIN_BASELINE_A, 1.0e9f);
+  float tripThreshold = referenceBaseline * (1.0f + currentFault.thresholdPercent);
+
+  if (absAmps > tripThreshold) {
+    if (currentFault.overThresholdSinceMs == 0) {
+      currentFault.overThresholdSinceMs = now;
+    } else if ((now - currentFault.overThresholdSinceMs) >= currentFault.tripDelayMs) {
+      tripCurrentFault(F("overcurrent"));
+    }
+  } else {
+    currentFault.overThresholdSinceMs = 0;
+  }
+}
+
 float clampf(float value, float lowerBound, float upperBound) {
   if (value < lowerBound) return lowerBound;
   if (value > upperBound) return upperBound;
@@ -295,6 +365,36 @@ void resetSsState() {
   ss.errorIntegral = 0.0f;
   ss.setpointRadPerSec = pid.setpointRadPerSec;
   ss.lastUpdateMs = millis();
+}
+
+void resetCurrentFaultState() {
+  currentFault.baselineAmps = 0.0f;
+  currentFault.motorStartMs = millis();
+  currentFault.overThresholdSinceMs = 0;
+  currentFault.baselineValid = false;
+  currentFault.armed = false;
+  currentFault.latched = false;
+  digitalWrite(PIN_STBY, HIGH);
+}
+
+void armCurrentFaultMonitor() {
+  currentFault.motorStartMs = millis();
+  currentFault.overThresholdSinceMs = 0;
+  currentFault.baselineValid = false;
+  currentFault.armed = false;
+}
+
+void tripCurrentFault(const __FlashStringHelper* reason) {
+  currentFault.latched = true;
+  motor.running = false;
+  pid.enabled = false;
+  controlMode = ControlMode::Manual;
+  stopMotor();
+  resetPidState();
+  resetSsState();
+  digitalWrite(PIN_STBY, LOW);
+  Serial.print(F("[FAULT] Current trip: "));
+  Serial.println(reason);
 }
 
 void setControlMode(ControlMode mode) {
@@ -332,6 +432,29 @@ void processCommand(const String& raw) {
     matlabReadableOutput = false;
     Serial.println(F("[OK] Human readable telemetry enabled"));
 
+  } else if (cmd.startsWith(F("OC ")) || cmd.startsWith(F("OVERCURRENT ")) || cmd.startsWith(F("CURFAULT "))) {
+    int firstSpace = cmd.indexOf(' ');
+    String rest = cmd.substring(firstSpace + 1);
+    int secondSpace = rest.indexOf(' ');
+    String percentStr = (secondSpace >= 0) ? rest.substring(0, secondSpace) : rest;
+    String delayStr = (secondSpace >= 0) ? rest.substring(secondSpace + 1) : String(F("250"));
+
+    float percentValue = percentStr.toFloat();
+    if (percentValue > 1.0f) {
+      percentValue /= 100.0f;
+    }
+    currentFault.thresholdPercent = clampf(percentValue, 0.0f, 10.0f);
+    currentFault.tripDelayMs = (uint32_t)delayStr.toInt();
+    if (currentFault.tripDelayMs < 1) {
+      currentFault.tripDelayMs = 1;
+    }
+
+    Serial.print(F("[OK] Overcurrent threshold set to "));
+    Serial.print(currentFault.thresholdPercent * 100.0f, 1);
+    Serial.print(F("% above baseline, delay="));
+    Serial.print(currentFault.tripDelayMs);
+    Serial.println(F(" ms"));
+
   } else if (cmd == F("MODE MANUAL") || cmd == F("MANUAL")) {
     setControlMode(ControlMode::Manual);
     pid.enabled = false;
@@ -341,12 +464,14 @@ void processCommand(const String& raw) {
   } else if (cmd == F("MODE PID") || cmd == F("PID MODE")) {
     setControlMode(ControlMode::PID);
     motor.running = true;
+    armCurrentFaultMonitor();
     applyMotor();
     Serial.println(F("[OK] Control mode -> PID"));
 
   } else if (cmd == F("MODE SS") || cmd == F("SS ON") || cmd == F("SS MODE")) {
     setControlMode(ControlMode::SS);
     motor.running = true;
+    armCurrentFaultMonitor();
     applyMotor();
     Serial.println(F("[OK] Control mode -> SS SERVO"));
 
@@ -373,6 +498,7 @@ void processCommand(const String& raw) {
   } else if (cmd == F("PID ON")) {
     setControlMode(ControlMode::PID);
     motor.running = true;
+    armCurrentFaultMonitor();
     stepMarkerPending = true;
     applyMotor();
     Serial.println(F("[OK] PID enabled"));
@@ -397,6 +523,7 @@ void processCommand(const String& raw) {
   } else if (cmd == F("GO") || cmd == F("START")) {
     motor.running = true;
     stepMarkerPending = true;
+    armCurrentFaultMonitor();
     if (controlMode == ControlMode::PID) resetPidState();
     if (controlMode == ControlMode::SS) resetSsState();
     applyMotor();
@@ -430,6 +557,7 @@ void processCommand(const String& raw) {
     speedPulseSnapshot = 0;
     outputRadPerSec = 0.0f;
     resetPidState();
+    resetCurrentFaultState();
     Serial.println(F("[OK] Encoder counter reset to 0"));
 
   } else if (cmd == F("C") || cmd == F("CURRENT")) {
@@ -467,6 +595,8 @@ void applyMotor() {
     stopMotor();
     return;
   }
+
+  digitalWrite(PIN_STBY, HIGH);
 
   if (motor.forward) {
     digitalWrite(PIN_AIN1, HIGH);
@@ -550,6 +680,8 @@ void printTelemetry(float amps) {
   Serial.print(motor.running ? F("ON ") : F("OFF"));
   Serial.print(F(" | Mode="));
   Serial.print(controlModeName());
+  Serial.print(F(" | OC="));
+  Serial.print(currentFault.latched ? F("TRIP") : (currentFault.armed ? F("ARM") : F("WAIT")));
   Serial.print(F(" | SP RPM="));
   Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 2);
   Serial.print(F(" | Pulses="));
@@ -570,6 +702,7 @@ void printHelp() {
   Serial.println(F("║  MODE MANUAL  Manual PWM mode                  ║"));
   Serial.println(F("║  MODE PID     Closed-loop PID mode             ║"));
   Serial.println(F("║  MODE SS      State-space servo mode           ║"));
+  Serial.println(F("║  OC <pct> <ms> Overcurrent trip vs baseline    ║"));
   Serial.println(F("║  MATLAB ON/OFF Enable CSV telemetry for MATLAB ║"));
   Serial.println(F("║  F / FWD      Direction -> Forward             ║"));
   Serial.println(F("║  R / REV      Direction -> Reverse             ║"));
@@ -584,5 +717,6 @@ void printHelp() {
   Serial.println(F("║  Telemetry every 10 ms | control: 20 ms        ║"));
   Serial.println(F("║  MATLAB mode outputs: t,pwm,dir,pulses,rpm,    ║"));
   Serial.println(F("║  omega,current                                 ║"));
+  Serial.println(F("║  RESET clears encoder and current fault        ║"));
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }
