@@ -56,17 +56,28 @@ static uint32_t lastTelemetry = 0;
 static constexpr float RAD_PER_SEC_TO_RPM = 60.0f / (2.0f * PI);
 
 // ─────────────────────────────────────────────
-//  PID GAINS FROM SIMULINK AND TIMING
+//  PID - SS GAINS FROM SIMULINK AND TIMING
 // ─────────────────────────────────────────────
 static constexpr float PID_KC = 134.345399f;
 static constexpr float PID_TI = 0.110091f;
 static constexpr float PID_TD = 0.036606f;
 static const float PID_KB = 1.0f / sqrtf(PID_TI * PID_TD);
 
+static constexpr float SS_K_OMEGA    = 0.268254f;
+static constexpr float SS_K_CURRENT  = 57.986618f;
+static constexpr float SS_K_INTEGRAL = -1220.314070f;
+static constexpr float SS_K_FF       = 0.039477f;
+
 static constexpr float PWM_MIN = 0.0f;
 static constexpr float PWM_MAX = 255.0f;
 
 static constexpr uint32_t CONTROL_PERIOD_MS = 50;
+
+enum class ControlMode {
+  Manual,
+  PID,
+  SS
+};
 
 // ─────────────────────────────────────────────
 //  STATE
@@ -84,6 +95,14 @@ struct PIDState {
   bool  enabled           = false;
   uint32_t lastUpdateMs   = 0;
 } pid;
+
+struct SSState {
+  float setpointRadPerSec = 0.0f;
+  float errorIntegral     = 0.0f;
+  uint32_t lastUpdateMs   = 0;
+} ss;
+
+ControlMode controlMode = ControlMode::Manual;
 
 volatile long encoderPulses = 0;
 
@@ -106,8 +125,12 @@ float readCurrentAmps();
 void  processCommand(const String& raw);
 void  updateSpeedRadPerSec();
 void  updatePidControl();
+void  updateSsControl();
 float clampf(float value, float lowerBound, float upperBound);
 void  resetPidState();
+void  resetSsState();
+void  setControlMode(ControlMode mode);
+const __FlashStringHelper* controlModeName();
 void  printTelemetry(float amps);
 void  printHelp();
 void  IRAM_ATTR encoderISR();
@@ -159,7 +182,11 @@ void loop() {
   uint32_t now = millis();
 
   updateSpeedRadPerSec();
-  updatePidControl();
+  if (controlMode == ControlMode::PID) {
+    updatePidControl();
+  } else if (controlMode == ControlMode::SS) {
+    updateSsControl();
+  }
 
   if (now - lastTelemetry >= TELEMETRY_MS) {
     lastTelemetry = now;
@@ -226,6 +253,32 @@ void updatePidControl() {
   applyMotor();
 }
 
+void updateSsControl() {
+  if (controlMode != ControlMode::SS || !motor.running) return;
+
+  uint32_t now = millis();
+  uint32_t elapsed = now - ss.lastUpdateMs;
+  if (elapsed < CONTROL_PERIOD_MS) return;
+
+  float dt = (float)elapsed / 1000.0f;
+  float speedError = ss.setpointRadPerSec - outputRadPerSec;
+  ss.errorIntegral += speedError * dt;
+
+  float currentAmps = readCurrentAmps();
+  float controlVoltage = SS_K_FF * ss.setpointRadPerSec
+                       - SS_K_OMEGA * outputRadPerSec
+                       - SS_K_CURRENT * currentAmps
+                       - SS_K_INTEGRAL * ss.errorIntegral;
+
+  float satOutput = clampf(controlVoltage, -PWM_MAX, PWM_MAX);
+
+  motor.forward = (satOutput >= 0.0f);
+  motor.pwm = (uint8_t)clampf(fabsf(satOutput), PWM_MIN, PWM_MAX);
+  motor.running = true;
+  ss.lastUpdateMs = now;
+  applyMotor();
+}
+
 float clampf(float value, float lowerBound, float upperBound) {
   if (value < lowerBound) return lowerBound;
   if (value > upperBound) return upperBound;
@@ -236,6 +289,32 @@ void resetPidState() {
   pid.integrator = 0.0f;
   pid.prevMeasurement = outputRadPerSec;
   pid.lastUpdateMs = millis();
+}
+
+void resetSsState() {
+  ss.errorIntegral = 0.0f;
+  ss.setpointRadPerSec = pid.setpointRadPerSec;
+  ss.lastUpdateMs = millis();
+}
+
+void setControlMode(ControlMode mode) {
+  controlMode = mode;
+  pid.enabled = (mode == ControlMode::PID);
+
+  if (mode == ControlMode::PID) {
+    resetPidState();
+  } else if (mode == ControlMode::SS) {
+    resetSsState();
+  }
+}
+
+const __FlashStringHelper* controlModeName() {
+  switch (controlMode) {
+    case ControlMode::Manual: return F("MANUAL");
+    case ControlMode::PID:    return F("PID");
+    case ControlMode::SS:     return F("SS");
+  }
+  return F("UNKNOWN");
 }
 
 // ═════════════════════════════════════════════
@@ -253,8 +332,26 @@ void processCommand(const String& raw) {
     matlabReadableOutput = false;
     Serial.println(F("[OK] Human readable telemetry enabled"));
 
-  } else if (cmd.startsWith("S ") || cmd.startsWith("SPEED ")) {
+  } else if (cmd == F("MODE MANUAL") || cmd == F("MANUAL")) {
+    setControlMode(ControlMode::Manual);
     pid.enabled = false;
+    stopMotor();
+    Serial.println(F("[OK] Control mode -> MANUAL"));
+
+  } else if (cmd == F("MODE PID") || cmd == F("PID MODE")) {
+    setControlMode(ControlMode::PID);
+    motor.running = true;
+    applyMotor();
+    Serial.println(F("[OK] Control mode -> PID"));
+
+  } else if (cmd == F("MODE SS") || cmd == F("SS ON") || cmd == F("SS MODE")) {
+    setControlMode(ControlMode::SS);
+    motor.running = true;
+    applyMotor();
+    Serial.println(F("[OK] Control mode -> SS SERVO"));
+
+  } else if (cmd.startsWith("S ") || cmd.startsWith("SPEED ")) {
+    setControlMode(ControlMode::Manual);
     int sp = cmd.substring(cmd.indexOf(' ') + 1).toInt();
     motor.pwm = (uint8_t)constrain(sp, 0, 255);
     if (motor.running) {
@@ -268,20 +365,20 @@ void processCommand(const String& raw) {
   } else if (cmd.startsWith(F("SP ")) || cmd.startsWith(F("SET "))) {
     float target = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
     pid.setpointRadPerSec = target;
+    ss.setpointRadPerSec = target;
     Serial.print(F("[OK] Setpoint set to "));
     Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 3);
     Serial.println(F(" RPM"));
 
   } else if (cmd == F("PID ON")) {
-    pid.enabled = true;
+    setControlMode(ControlMode::PID);
     motor.running = true;
     stepMarkerPending = true;
-    resetPidState();
     applyMotor();
     Serial.println(F("[OK] PID enabled"));
 
   } else if (cmd == F("PID OFF")) {
-    pid.enabled = false;
+    setControlMode(ControlMode::Manual);
     stopMotor();
     Serial.println(F("[OK] PID disabled"));
 
@@ -300,13 +397,16 @@ void processCommand(const String& raw) {
   } else if (cmd == F("GO") || cmd == F("START")) {
     motor.running = true;
     stepMarkerPending = true;
-    if (pid.enabled) resetPidState();
+    if (controlMode == ControlMode::PID) resetPidState();
+    if (controlMode == ControlMode::SS) resetSsState();
     applyMotor();
     Serial.println(F("[OK] Motor started"));
 
   } else if (cmd == F("STOP") || cmd == F("X")) {
     motor.running = false;
+    controlMode = ControlMode::Manual;
     pid.enabled = false;
+    resetSsState();
     stopMotor();
     resetPidState();
     Serial.println(F("[OK] Motor stopped (coast)"));
@@ -343,7 +443,9 @@ void processCommand(const String& raw) {
 
   } else if (cmd == F("STBY OFF")) {
     motor.running = false;
+    controlMode = ControlMode::Manual;
     pid.enabled = false;
+    resetSsState();
     stopMotor();
     digitalWrite(PIN_STBY, LOW);
     Serial.println(F("[OK] STBY LOW - driver in standby"));
@@ -446,8 +548,8 @@ void printTelemetry(float amps) {
   Serial.print(motor.forward ? F("FWD") : F("REV"));
   Serial.print(F(" | Motor="));
   Serial.print(motor.running ? F("ON ") : F("OFF"));
-  Serial.print(F(" | PID="));
-  Serial.print(pid.enabled ? F("ON") : F("OFF"));
+  Serial.print(F(" | Mode="));
+  Serial.print(controlModeName());
   Serial.print(F(" | SP RPM="));
   Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 2);
   Serial.print(F(" | Pulses="));
@@ -460,11 +562,14 @@ void printTelemetry(float amps) {
 
 void printHelp() {
   Serial.println(F("╔════════════════════════════════════════════════╗"));
-  Serial.println(F("║  Infusion Pump - ESP32 Open Loop + PID         ║"));
+  Serial.println(F("║  Infusion Pump - ESP32 Control Modes           ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
   Serial.println(F("║  S <0-255>    Set PWM speed                    ║"));
   Serial.println(F("║  SP <rad/s>   Set PID speed setpoint           ║"));
   Serial.println(F("║  PID ON/OFF   Enable / disable PID control      ║"));
+  Serial.println(F("║  MODE MANUAL  Manual PWM mode                  ║"));
+  Serial.println(F("║  MODE PID     Closed-loop PID mode             ║"));
+  Serial.println(F("║  MODE SS      State-space servo mode           ║"));
   Serial.println(F("║  MATLAB ON/OFF Enable CSV telemetry for MATLAB ║"));
   Serial.println(F("║  F / FWD      Direction -> Forward             ║"));
   Serial.println(F("║  R / REV      Direction -> Reverse             ║"));
