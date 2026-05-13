@@ -35,7 +35,7 @@ TARGET_SPEED_RPM = 6.0;   % desired speed setpoint shown in plots
 TEST_TIME        = 3;     % seconds
 SUPPLY_VOLT      = 12.0;  % motor supply voltage
 
-TELEMETRY_MS     = 10;    % Sampling interval in milliseconds (must match ESP32)
+TELEMETRY_MS     = 20;    % Sampling interval in milliseconds (must match ESP32)
 
 PWM_PER_RPM_EST  = 40.0; % Open-loop feedforward guess used to convert speed setpoint into PWM.
 PWM_STEP         = min(max(round(TARGET_SPEED_RPM * PWM_PER_RPM_EST), 1), 255);

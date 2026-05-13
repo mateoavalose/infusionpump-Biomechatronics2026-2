@@ -31,7 +31,7 @@ static constexpr float ACS712_ZERO_ADC_MV = 1260.0f;
 static constexpr float ACS712_SENS_MV_A   =   97.04f;
 static constexpr float ADC_REF_MV         = 3300.0f;
 static constexpr float ADC_RESOLUTION     = 4095.0f;
-static constexpr int   CURRENT_SAMPLES    = 5;
+static constexpr int   CURRENT_SAMPLES    = 30;
 
 // ─────────────────────────────────────────────
 //  ENCODER & GEARBOX CONSTANTS
@@ -41,12 +41,16 @@ static constexpr float GEAR_RATIO           = 472.7272f;
 static constexpr int   ENC_EDGES_PER_PULSE  = 2;
 static constexpr float PULSES_PER_OUTPUT_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO * ENC_EDGES_PER_PULSE;
 
-static constexpr uint32_t SPEED_UPDATE_MS   = 10;
+// ─────────────────────────────────────────────
+//  SPEED CALCULATION & FILTERING
+// ─────────────────────────────────────────────
+static constexpr uint32_t SPEED_UPDATE_MS   = 20;
+static constexpr float    EMA_ALPHA         = 0.05f;
 
 // ─────────────────────────────────────────────
 //  TELEMETRY TIMING
 // ─────────────────────────────────────────────
-static constexpr uint32_t TELEMETRY_MS = 10;
+static constexpr uint32_t TELEMETRY_MS = 20;
 static uint32_t lastTelemetry = 0;
 
 static constexpr float RAD_PER_SEC_TO_RPM = 60.0f / (2.0f * PI);
@@ -62,7 +66,7 @@ static const float PID_KB = 1.0f / sqrtf(PID_TI * PID_TD);
 static constexpr float PWM_MIN = 0.0f;
 static constexpr float PWM_MAX = 255.0f;
 
-static constexpr uint32_t CONTROL_PERIOD_MS = 100;
+static constexpr uint32_t CONTROL_PERIOD_MS = 50;
 
 // ─────────────────────────────────────────────
 //  STATE
@@ -185,7 +189,11 @@ void updateSpeedRadPerSec() {
   float elapsedSec  = (float)elapsed / 1000.0f;
   float revPerSec   = ((float)deltaPulses / PULSES_PER_OUTPUT_REV) / elapsedSec;
 
-  outputRadPerSec   = revPerSec * (2.0f * PI);
+  float rawRadPerSec = revPerSec * (2.0f * PI);
+  
+  // Apply Exponential Moving Average (EMA) filter
+  outputRadPerSec = (EMA_ALPHA * rawRadPerSec) + ((1.0f - EMA_ALPHA) * outputRadPerSec);
+  
   speedPulseSnapshot = currentPulses;
   speedLastCalcMs    = now;
 }
