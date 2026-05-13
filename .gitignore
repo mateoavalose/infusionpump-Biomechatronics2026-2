@@ -37,3 +37,4 @@
 
 .matlab/slprj
 .matlab/*.slcx
+.matlab/*.asv
