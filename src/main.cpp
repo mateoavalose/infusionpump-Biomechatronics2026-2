@@ -79,6 +79,16 @@ static constexpr float    CURRENT_FAULT_PERCENT = 0.30f;
 static constexpr float    CURRENT_FAULT_BASELINE_ALPHA = 0.02f;
 static constexpr float    CURRENT_FAULT_MIN_BASELINE_A = 0.05f;
 
+// ─────────────────────────────────────────────
+//  INFUSION PUMP GEOMETRY
+// ─────────────────────────────────────────────
+static constexpr float SYRINGE_DIAMETER_MM = 29.0f;           // Syringe inner diameter [mm]
+static constexpr float SCREW_PITCH_TURNS_PER_INCH = 13.0f;    // Screw pitch: 13 turns per inch
+static constexpr float MM_PER_INCH = 25.4f;
+static constexpr float MM_PER_SCREW_TURN = MM_PER_INCH / SCREW_PITCH_TURNS_PER_INCH;
+static constexpr float SYRINGE_AREA_MM2 = (SYRINGE_DIAMETER_MM / 2.0f) * (SYRINGE_DIAMETER_MM / 2.0f) * PI;
+static constexpr float VOLUME_PER_OUTPUT_REV_ML = (SYRINGE_AREA_MM2 * MM_PER_SCREW_TURN) / 1000.0f;
+
 enum class ControlMode {
   Manual,
   PID,
@@ -120,6 +130,15 @@ struct CurrentFaultState {
   uint32_t tripDelayMs = CURRENT_FAULT_TRIP_MS;
 } currentFault;
 
+struct InfusionState {
+  float targetVolumeMl = 0.0f;          // Target volume to inject [mL]
+  float flowRateMlPerMin = 0.0f;        // Flow rate [mL/min]
+  float volumeInjectedMl = 0.0f;        // Volume injected so far [mL]
+  long pulsesAtStartOfInfusion = 0;     // Encoder pulses when infusion started
+  bool infusing = false;                // Whether currently infusing
+  uint32_t infusionStartMs = 0;         // When infusion started
+} infusion;
+
 ControlMode controlMode = ControlMode::Manual;
 
 volatile long encoderPulses = 0;
@@ -154,6 +173,10 @@ void  armCurrentFaultMonitor();
 void  tripCurrentFault(const __FlashStringHelper* reason);
 void  setControlMode(ControlMode mode);
 const __FlashStringHelper* controlModeName();
+void  updateInfusionControl();
+void  startInfusion();
+void  stopInfusion();
+void  resetInfusionState();
 void  printTelemetry(float amps);
 void  printHelp();
 void  IRAM_ATTR encoderISR();
@@ -216,6 +239,8 @@ void loop() {
   } else if (controlMode == ControlMode::SS) {
     updateSsControl();
   }
+  
+  updateInfusionControl();
 
   if (now - lastTelemetry >= TELEMETRY_MS) {
     lastTelemetry = now;
@@ -349,6 +374,82 @@ void updateCurrentFaultMonitor(float amps) {
   }
 }
 
+void updateInfusionControl() {
+  if (!infusion.infusing) return;
+
+  uint32_t now = millis();
+  
+  portENTER_CRITICAL(&encoderMux);
+  long currentPulses = encoderPulses;
+  portEXIT_CRITICAL(&encoderMux);
+
+  long deltaPulses = currentPulses - infusion.pulsesAtStartOfInfusion;
+  infusion.volumeInjectedMl = (float)deltaPulses * VOLUME_PER_OUTPUT_REV_ML / PULSES_PER_OUTPUT_REV;
+
+  if (infusion.volumeInjectedMl >= infusion.targetVolumeMl) {
+    stopInfusion();
+    Serial.print(F("[INFO] Infusion complete. Volume injected: "));
+    Serial.print(infusion.volumeInjectedMl, 2);
+    Serial.println(F(" mL"));
+  }
+}
+
+void startInfusion() {
+  if (infusion.targetVolumeMl <= 0.0f) {
+    Serial.println(F("[ERR] Target volume must be > 0 mL"));
+    return;
+  }
+  if (infusion.flowRateMlPerMin <= 0.0f) {
+    Serial.println(F("[ERR] Flow rate must be > 0 mL/min"));
+    return;
+  }
+
+  float rpmRequired = infusion.flowRateMlPerMin / VOLUME_PER_OUTPUT_REV_ML;
+  float radPerSecRequired = rpmRequired * 2.0f * PI / 60.0f;
+
+  portENTER_CRITICAL(&encoderMux);
+  infusion.pulsesAtStartOfInfusion = encoderPulses;
+  portEXIT_CRITICAL(&encoderMux);
+
+  infusion.volumeInjectedMl = 0.0f;
+  infusion.infusing = true;
+  infusion.infusionStartMs = millis();
+
+  pid.setpointRadPerSec = radPerSecRequired;
+  ss.setpointRadPerSec = radPerSecRequired;
+  motor.running = true;
+  controlMode = ControlMode::PID;
+  resetPidState();
+  armCurrentFaultMonitor();
+  applyMotor();
+
+  Serial.print(F("[OK] Infusion started: "));
+  Serial.print(infusion.targetVolumeMl, 2);
+  Serial.print(F(" mL at "));
+  Serial.print(infusion.flowRateMlPerMin, 2);
+  Serial.print(F(" mL/min (RPM: "));
+  Serial.print(rpmRequired, 2);
+  Serial.println(F(")"));
+}
+
+void stopInfusion() {
+  infusion.infusing = false;
+  motor.running = false;
+  pid.enabled = false;
+  controlMode = ControlMode::Manual;
+  stopMotor();
+  resetPidState();
+}
+
+void resetInfusionState() {
+  infusion.targetVolumeMl = 0.0f;
+  infusion.flowRateMlPerMin = 0.0f;
+  infusion.volumeInjectedMl = 0.0f;
+  infusion.pulsesAtStartOfInfusion = 0;
+  infusion.infusing = false;
+  infusion.infusionStartMs = 0;
+}
+
 float clampf(float value, float lowerBound, float upperBound) {
   if (value < lowerBound) return lowerBound;
   if (value > upperBound) return upperBound;
@@ -455,6 +556,23 @@ void processCommand(const String& raw) {
     Serial.print(currentFault.tripDelayMs);
     Serial.println(F(" ms"));
 
+  } else if (cmd.startsWith(F("VOL ")) || cmd.startsWith(F("VOLUME "))) {
+    float vol = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
+    infusion.targetVolumeMl = vol;
+    Serial.print(F("[OK] Target volume set to "));
+    Serial.print(infusion.targetVolumeMl, 2);
+    Serial.println(F(" mL"));
+
+  } else if (cmd.startsWith(F("FLOW "))) {
+    float flow = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
+    infusion.flowRateMlPerMin = flow;
+    Serial.print(F("[OK] Flow rate set to "));
+    Serial.print(infusion.flowRateMlPerMin, 2);
+    Serial.println(F(" mL/min"));
+
+  } else if (cmd == F("INFUSE") || cmd == F("INJECT")) {
+    startInfusion();
+
   } else if (cmd == F("MODE MANUAL") || cmd == F("MANUAL")) {
     setControlMode(ControlMode::Manual);
     pid.enabled = false;
@@ -551,14 +669,32 @@ void processCommand(const String& raw) {
     Serial.println(outputRadPerSec * RAD_PER_SEC_TO_RPM, 3);
 
   } else if (cmd == F("RESET")) {
+    // Stop motor and clear all control signals
+    stopMotor();
+    motor.pwm = 0;
+    motor.forward = true;
+    motor.running = false;
+    
+    // Reset encoder and speed tracking
     portENTER_CRITICAL(&encoderMux);
     encoderPulses = 0;
     portEXIT_CRITICAL(&encoderMux);
     speedPulseSnapshot = 0;
     outputRadPerSec = 0.0f;
+    
+    // Reset all control modes and setpoints
+    pid.setpointRadPerSec = 0.0f;
+    pid.enabled = false;
+    ss.setpointRadPerSec = 0.0f;
+    controlMode = ControlMode::Manual;
+    
+    // Reset state estimators and accumulators
     resetPidState();
+    resetSsState();
+    resetInfusionState();
     resetCurrentFaultState();
-    Serial.println(F("[OK] Encoder counter reset to 0"));
+    
+    Serial.println(F("[OK] Full system reset: motor, encoder, setpoints, PID, SS, infusion, faults"));
 
   } else if (cmd == F("C") || cmd == F("CURRENT")) {
     Serial.print(F("[CURRENT] "));
@@ -682,6 +818,15 @@ void printTelemetry(float amps) {
   Serial.print(controlModeName());
   Serial.print(F(" | OC="));
   Serial.print(currentFault.latched ? F("TRIP") : (currentFault.armed ? F("ARM") : F("WAIT")));
+  if (infusion.infusing) {
+    Serial.print(F(" | Infusing=YES | Vol="));
+    Serial.print(infusion.volumeInjectedMl, 2);
+    Serial.print(F("/"));
+    Serial.print(infusion.targetVolumeMl, 2);
+    Serial.print(F(" mL | Flow="));
+    Serial.print(infusion.flowRateMlPerMin, 2);
+    Serial.print(F(" mL/min"));
+  }
   Serial.print(F(" | SP RPM="));
   Serial.print(pid.setpointRadPerSec * RAD_PER_SEC_TO_RPM, 2);
   Serial.print(F(" | Pulses="));
@@ -694,8 +839,14 @@ void printTelemetry(float amps) {
 
 void printHelp() {
   Serial.println(F("╔════════════════════════════════════════════════╗"));
-  Serial.println(F("║  Infusion Pump - ESP32 Control Modes           ║"));
+  Serial.println(F("║  Infusion Pump - ESP32 Control & Infusion     ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
+  Serial.println(F("║  INFUSION COMMANDS:                            ║"));
+  Serial.println(F("║  VOL <mL>     Set target infusion volume       ║"));
+  Serial.println(F("║  FLOW <mL/m>  Set infusion flow rate           ║"));
+  Serial.println(F("║  INFUSE       Start infusion (auto-stop)       ║"));
+  Serial.println(F("║                                                ║"));
+  Serial.println(F("║  CONTROL MODES:                                ║"));
   Serial.println(F("║  S <0-255>    Set PWM speed                    ║"));
   Serial.println(F("║  SP <rad/s>   Set PID speed setpoint           ║"));
   Serial.println(F("║  PID ON/OFF   Enable / disable PID control      ║"));
@@ -714,9 +865,7 @@ void printHelp() {
   Serial.println(F("║  STBY ON/OFF  Enable / disable driver          ║"));
   Serial.println(F("║  H / HELP     Show this menu                   ║"));
   Serial.println(F("╠════════════════════════════════════════════════╣"));
-  Serial.println(F("║  Telemetry every 10 ms | control: 20 ms        ║"));
-  Serial.println(F("║  MATLAB mode outputs: t,pwm,dir,pulses,rpm,    ║"));
-  Serial.println(F("║  omega,current                                 ║"));
-  Serial.println(F("║  RESET clears encoder and current fault        ║"));
+  Serial.println(F("║  Telemetry every 20 ms | control: 50 ms        ║"));
+  Serial.println(F("║  Syringe: 29mm Ø, 50mL | Screw: 13 TPI         ║"));
   Serial.println(F("╚════════════════════════════════════════════════╝"));
 }
