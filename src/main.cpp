@@ -71,7 +71,7 @@ static constexpr uint32_t CURRENT_CHECK_MS = 20;
 static constexpr uint32_t CURRENT_FAULT_ARM_MS = 300;
 static constexpr uint32_t CURRENT_FAULT_TRIP_MS = 250;
 static constexpr float    CURRENT_FAULT_PERCENT = 0.30f;
-static constexpr float    CURRENT_FAULT_BASELINE_ALPHA = 0.02f;
+static constexpr float    CURRENT_FAULT_BASELINE_ALPHA = 0.0005f;
 static constexpr float    CURRENT_FAULT_MIN_BASELINE_A = 0.05f;
 
 static constexpr float SYRINGE_DIAMETER_MM = 29.0f;           
@@ -118,6 +118,7 @@ struct CurrentFaultState {
   bool baselineValid = false;
   bool armed = false;
   bool latched = false;
+  bool warningActive = false;
   float thresholdPercent = CURRENT_FAULT_PERCENT;
   uint32_t armDelayMs = CURRENT_FAULT_ARM_MS;
   uint32_t tripDelayMs = CURRENT_FAULT_TRIP_MS;
@@ -189,7 +190,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BioFlow - Infusion Pump</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
   <style>
     :root { --bg: #f4f4f9; --nav: #2c3e50; --primary: #3498db; --text: #333; --panel: #fff; --danger: #e74c3c; --success: #2ecc71;}
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg); margin: 0; color: var(--text); }
@@ -220,7 +221,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <div class="header">
     <h2>💉 BioFlow Controller</h2>
-    <div>
+    <div style="display:flex; gap:10px;">
+      <span id="occlusionStatus" class="status-badge" style="display:none;"></span>
       <span id="wsStatus" class="status-badge" style="background: var(--danger);">Offline</span>
       <span id="modeStatus" class="status-badge">MANUAL</span>
     </div>
@@ -281,6 +283,8 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="rpm">RPM Actual</option>
           <option value="sp">RPM Setpoint</option>
           <option value="I">Current (A)</option>
+          <option value="I_lim_H">Current Limit (High)</option>
+          <option value="I_lim_L">Current Limit (Low)</option>
           <option value="volI">Volume Injected (mL)</option>
           <option value="pwm">Motor PWM</option>
         </select>
@@ -292,10 +296,15 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="rpm">RPM Actual</option>
           <option value="sp">RPM Setpoint</option>
           <option value="I">Current (A)</option>
+          <option value="I_lim_H">Current Limit (High)</option>
+          <option value="I_lim_L">Current Limit (Low)</option>
           <option value="volI">Volume Injected (mL)</option>
           <option value="pwm">Motor PWM</option>
         </select>
       </div>
+    </div>
+    <div id="chartStatus" style="display:none; margin-bottom:10px; color: var(--danger); font-weight: bold;">
+      Chart.js could not be loaded from CDN. Controls and telemetry remain available, but plotting is disabled.
     </div>
     <canvas id="chart1" height="100"></canvas>
 
@@ -306,6 +315,8 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="I" selected>Current (A)</option>
           <option value="rpm">RPM Actual</option>
           <option value="sp">RPM Setpoint</option>
+          <option value="I_lim_H">Current Limit (High)</option>
+          <option value="I_lim_L">Current Limit (Low)</option>
           <option value="volI">Volume Injected (mL)</option>
           <option value="pwm">Motor PWM</option>
         </select>
@@ -317,6 +328,8 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="I">Current (A)</option>
           <option value="rpm">RPM Actual</option>
           <option value="sp">RPM Setpoint</option>
+          <option value="I_lim_H">Current Limit (High)</option>
+          <option value="I_lim_L">Current Limit (Low)</option>
           <option value="volI">Volume Injected (mL)</option>
           <option value="pwm">Motor PWM</option>
         </select>
@@ -399,70 +412,81 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     // Chart.js Setup
     const maxPoints = 50;
-    const ctx1 = document.getElementById('chart1').getContext('2d');
-    const ctx2 = document.getElementById('chart2').getContext('2d');
+    let chart1 = null;
+    let chart2 = null;
 
-    const chart1 = new Chart(ctx1, {
-      type: 'line',
-      data: { 
-        labels: [], 
-        datasets: [
-          { label: 'Trace A', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
-          { label: 'Trace B', borderColor: '#2ecc71', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
-        ] 
-      },
-      options: { 
-        animation: false, 
-        responsive: true,
-        scales: {
-          y: {
-            type: 'linear',
-            position: 'left',
-            suggestedMin: -0.5,
-            suggestedMax: 2.5
-          },
-          y1: {
-            type: 'linear',
-            position: 'right',
-            suggestedMin: -0.5,
-            suggestedMax: 2.5,
-            grid: { drawOnChartArea: false }
+    function initCharts() {
+      if (typeof Chart === 'undefined') {
+        document.getElementById('chartStatus').style.display = 'block';
+        return;
+      }
+
+      const ctx1 = document.getElementById('chart1').getContext('2d');
+      const ctx2 = document.getElementById('chart2').getContext('2d');
+
+      chart1 = new Chart(ctx1, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            { label: 'Trace A', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
+            { label: 'Trace B', borderColor: '#2ecc71', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          scales: {
+            y: {
+              type: 'linear',
+              position: 'left',
+              suggestedMin: -0.5,
+              suggestedMax: 2.5
+            },
+            y1: {
+              type: 'linear',
+              position: 'right',
+              suggestedMin: -0.5,
+              suggestedMax: 2.5,
+              grid: { drawOnChartArea: false }
+            }
           }
         }
-      }
-    });
+      });
 
-    const chart2 = new Chart(ctx2, {
-      type: 'line',
-      data: { 
-        labels: [], 
-        datasets: [
-          { label: 'Trace A', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
-          { label: 'Trace B', borderColor: '#f1c40f', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
-        ] 
-      },
-      options: { 
-        animation: false, 
-        responsive: true,
-        scales: {
-          y: {
-            type: 'linear',
-            position: 'left',
-            suggestedMin: -0.5,
-            suggestedMax: 2.5
-          },
-          y1: {
-            type: 'linear',
-            position: 'right',
-            suggestedMin: -0.5,
-            suggestedMax: 2.5,
-            grid: { drawOnChartArea: false }
+      chart2 = new Chart(ctx2, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            { label: 'Trace A', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
+            { label: 'Trace B', borderColor: '#f1c40f', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          scales: {
+            y: {
+              type: 'linear',
+              position: 'left',
+              suggestedMin: -0.5,
+              suggestedMax: 2.5
+            },
+            y1: {
+              type: 'linear',
+              position: 'right',
+              suggestedMin: -0.5,
+              suggestedMax: 2.5,
+              grid: { drawOnChartArea: false }
+            }
           }
         }
-      }
-    });
+      });
+    }
 
     function clearCharts() {
+      if (!chart1 || !chart2) return;
       chart1.data.labels = []; 
       chart1.data.datasets[0].data = []; 
       chart1.data.datasets[1].data = []; 
@@ -474,6 +498,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function updateCharts(data) {
+      if (!chart1 || !chart2) return;
       const timeStr = (data.t / 1000).toFixed(1) + "s";
       const g1A = document.getElementById('g1A').value;
       const g1B = document.getElementById('g1B').value;
@@ -482,8 +507,25 @@ const char index_html[] PROGMEM = R"rawliteral(
 
       const isSameUnit = (a, b) => {
         if ((a === 'rpm' || a === 'sp') && (b === 'rpm' || b === 'sp')) return true;
+        if ((a === 'I' || a === 'I_lim_H' || a === 'I_lim_L') && (b === 'I' || b === 'I_lim_H' || b === 'I_lim_L')) return true;
         return a === b;
       };
+
+      const colorMap = {
+        'rpm': '#3498db',     // Blue (Controlled)
+        'sp': '#e74c3c',      // Red (Setpoint)
+        'I': '#3498db',       // Blue (Controlled)
+        'I_lim_H': '#e74c3c', // Red (Reference)
+        'I_lim_L': '#e74c3c', // Red (Reference)
+        'volI': '#3498db',    // Blue (Controlled)
+        'pwm': '#2ecc71'      // Green (Manipulated)
+      };
+
+      const isCurrentAxis = (v) => v === 'I' || v === 'I_lim_H' || v === 'I_lim_L';
+      chart1.options.scales.y.suggestedMax  = isCurrentAxis(g1A) ? 1.5 : 2.5;
+      chart1.options.scales.y1.suggestedMax = isCurrentAxis(g1B) ? 1.5 : 2.5;
+      chart2.options.scales.y.suggestedMax  = isCurrentAxis(g2A) ? 1.5 : 2.5;
+      chart2.options.scales.y1.suggestedMax = isCurrentAxis(g2B) ? 1.5 : 2.5;
 
       chart1.data.datasets[1].yAxisID = isSameUnit(g1A, g1B) ? 'y' : 'y1';
       chart2.data.datasets[1].yAxisID = isSameUnit(g2A, g2B) ? 'y' : 'y1';
@@ -500,11 +542,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
       
       chart1.data.labels.push(timeStr);
+      chart1.data.datasets[0].borderColor = colorMap[g1A] || '#333';
       chart1.data.datasets[0].label = document.getElementById('g1A').options[document.getElementById('g1A').selectedIndex].text;
       chart1.data.datasets[0].data.push(data[g1A]);
       
       if (g1B !== "none") {
         chart1.data.datasets[1].hidden = false;
+        chart1.data.datasets[1].borderColor = colorMap[g1B] || '#333';
         chart1.data.datasets[1].label = document.getElementById('g1B').options[document.getElementById('g1B').selectedIndex].text;
         chart1.data.datasets[1].data.push(data[g1B]);
       } else {
@@ -514,11 +558,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       chart1.update();
 
       chart2.data.labels.push(timeStr);
+      chart2.data.datasets[0].borderColor = colorMap[g2A] || '#333';
       chart2.data.datasets[0].label = document.getElementById('g2A').options[document.getElementById('g2A').selectedIndex].text;
       chart2.data.datasets[0].data.push(data[g2A]);
 
       if (g2B !== "none") {
         chart2.data.datasets[1].hidden = false;
+        chart2.data.datasets[1].borderColor = colorMap[g2B] || '#333';
         chart2.data.datasets[1].label = document.getElementById('g2B').options[document.getElementById('g2B').selectedIndex].text;
         chart2.data.datasets[1].data.push(data[g2B]);
       } else {
@@ -555,10 +601,19 @@ const char index_html[] PROGMEM = R"rawliteral(
       } 
       else if (data.type === 'tel') {
         // Update Status Badge
-        document.getElementById('modeStatus').innerText = data.mode + (data.flt ? " [FAULT]" : "");
-        if(data.flt) document.getElementById('modeStatus').style.background = "var(--danger)";
-        else document.getElementById('modeStatus').style.background = "#7f8c8d";
-
+        document.getElementById('modeStatus').innerText = data.mode;
+        if (data.flt) {
+          document.getElementById('occlusionStatus').innerText = "Stopped for Occlusion";
+          document.getElementById('occlusionStatus').style.background = "var(--danger)";
+          document.getElementById('occlusionStatus').style.display = "inline-block";
+        } else if (data.I_warn) {
+          document.getElementById('occlusionStatus').innerText = "High Current Warning";
+          document.getElementById('occlusionStatus').style.background = "#f39c12"; // Orange/Yellow
+          document.getElementById('occlusionStatus').style.display = "inline-block";
+        } else {
+          document.getElementById('occlusionStatus').style.display = "none";
+        }
+        
         // Sync Infusion Buttons
         if (data.inf) {
           document.getElementById('btnStart').style.display = 'none';
@@ -600,7 +655,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
     }
 
-    window.onload = initWebSocket;
+    window.onload = () => {
+      initCharts();
+      initWebSocket();
+    };
   </script>
 </body>
 </html>
@@ -742,6 +800,14 @@ void logMessage(const String& msg) {
 void broadcastTelemetry(float amps) {
   if(ws.count() == 0) return; // Save cycles if no one is looking
 
+  float referenceBaseline = clampf(currentFault.baselineAmps, CURRENT_FAULT_MIN_BASELINE_A, 1.0e9f);
+  float tripH = currentFault.baselineValid ? (referenceBaseline * (1.0f + currentFault.thresholdPercent)) : 0.0f;
+  float tripL = currentFault.baselineValid ? (referenceBaseline * (1.0f - currentFault.thresholdPercent)) : 0.0f;
+  bool iWarn = false;
+  if (motor.running && currentFault.baselineValid && !currentFault.latched) {
+      if (fabsf(amps) >= tripH * 0.8f) iWarn = true;
+  }
+
   JsonDocument doc;
   doc["type"] = "tel";
   doc["t"]    = millis();
@@ -755,6 +821,9 @@ void broadcastTelemetry(float amps) {
   doc["volT"] = infusion.targetVolumeMl;
   doc["flt"]  = currentFault.latched;
   doc["pwm"]  = motor.running ? motor.pwm : 0;
+  doc["I_lim_H"] = tripH;
+  doc["I_lim_L"] = tripL;
+  doc["I_warn"] = currentFault.warningActive;
   
   String out;
   serializeJson(doc, out);
@@ -839,6 +908,7 @@ void updateCurrentFaultMonitor(float amps) {
 
   if (!motor.running || currentFault.latched) {
     currentFault.overThresholdSinceMs = 0;
+    currentFault.warningActive = false;
     return;
   }
 
@@ -860,7 +930,15 @@ void updateCurrentFaultMonitor(float amps) {
   }
 
   float referenceBaseline = clampf(currentFault.baselineAmps, CURRENT_FAULT_MIN_BASELINE_A, 1.0e9f);
+  float warnThresholdHigh = referenceBaseline * (1.0f + currentFault.thresholdPercent * 0.8f);
+  float warnThresholdLow = warnThresholdHigh * 0.95f;
   float tripThreshold = referenceBaseline * (1.0f + currentFault.thresholdPercent);
+
+  if (!currentFault.warningActive) {
+    currentFault.warningActive = (absAmps >= warnThresholdHigh);
+  } else if (absAmps <= warnThresholdLow) {
+    currentFault.warningActive = false;
+  }
 
   if (absAmps > tripThreshold) {
     if (currentFault.overThresholdSinceMs == 0) {
@@ -1028,6 +1106,7 @@ void resetCurrentFaultState() {
   currentFault.baselineValid = false;
   currentFault.armed = false;
   currentFault.latched = false;
+  currentFault.warningActive = false;
   digitalWrite(PIN_STBY, HIGH);
 }
 
@@ -1036,10 +1115,12 @@ void armCurrentFaultMonitor() {
   currentFault.overThresholdSinceMs = 0;
   currentFault.baselineValid = false;
   currentFault.armed = false;
+  currentFault.warningActive = false;
 }
 
 void tripCurrentFault(const String& reason) {
   currentFault.latched = true;
+  currentFault.warningActive = false;
   motor.running = false;
   pid.enabled = false;
   controlMode = ControlMode::Manual;
