@@ -95,6 +95,11 @@ enum class ControlMode {
   SS
 };
 
+enum class InfusionControlMode {
+  PID,
+  SS
+};
+
 // ─────────────────────────────────────────────
 //  STATE
 // ─────────────────────────────────────────────
@@ -133,11 +138,15 @@ struct CurrentFaultState {
 struct InfusionState {
   float targetVolumeMl = 0.0f;          // Target volume to inject [mL]
   float flowRateMlPerMin = 0.0f;        // Flow rate [mL/min]
+  float targetRpm = 0.0f;               // Calculated infusion speed [RPM]
+  float targetRadPerSec = 0.0f;         // Calculated infusion speed [rad/s]
   float volumeInjectedMl = 0.0f;        // Volume injected so far [mL]
   long pulsesAtStartOfInfusion = 0;     // Encoder pulses when infusion started
   bool infusing = false;                // Whether currently infusing
   uint32_t infusionStartMs = 0;         // When infusion started
 } infusion;
+
+InfusionControlMode infusionControlMode = InfusionControlMode::PID;
 
 ControlMode controlMode = ControlMode::Manual;
 
@@ -174,6 +183,9 @@ void  tripCurrentFault(const __FlashStringHelper* reason);
 void  setControlMode(ControlMode mode);
 const __FlashStringHelper* controlModeName();
 void  updateInfusionControl();
+void  updateInfusionSetpoint();
+void  setInfusionControlMode(InfusionControlMode mode);
+const __FlashStringHelper* infusionControlModeName();
 void  startInfusion();
 void  stopInfusion();
 void  resetInfusionState();
@@ -318,10 +330,10 @@ void updateSsControl() {
   float speedError = ss.setpointRadPerSec - outputRadPerSec;
   ss.errorIntegral += speedError * dt;
 
-  float currentAmps = readCurrentAmps();
+  //float currentAmps = readCurrentAmps();
   float controlVoltage = SS_K_FF * ss.setpointRadPerSec
                        - SS_K_OMEGA * outputRadPerSec
-                       - SS_K_CURRENT * currentAmps
+                       //- SS_K_CURRENT * currentAmps
                        - SS_K_INTEGRAL * ss.errorIntegral;
 
   float satOutput = clampf(controlVoltage, -PWM_MAX, PWM_MAX);
@@ -394,6 +406,33 @@ void updateInfusionControl() {
   }
 }
 
+void updateInfusionSetpoint() {
+  if (infusion.flowRateMlPerMin <= 0.0f) {
+    infusion.targetRpm = 0.0f;
+    infusion.targetRadPerSec = 0.0f;
+    pid.setpointRadPerSec = 0.0f;
+    ss.setpointRadPerSec = 0.0f;
+    return;
+  }
+
+  infusion.targetRpm = infusion.flowRateMlPerMin / VOLUME_PER_OUTPUT_REV_ML;
+  infusion.targetRadPerSec = infusion.targetRpm * 2.0f * PI / 60.0f;
+  pid.setpointRadPerSec = infusion.targetRadPerSec;
+  ss.setpointRadPerSec = infusion.targetRadPerSec;
+}
+
+void setInfusionControlMode(InfusionControlMode mode) {
+  infusionControlMode = mode;
+}
+
+const __FlashStringHelper* infusionControlModeName() {
+  switch (infusionControlMode) {
+    case InfusionControlMode::PID: return F("PID");
+    case InfusionControlMode::SS:  return F("SS");
+  }
+  return F("UNKNOWN");
+}
+
 void startInfusion() {
   if (infusion.targetVolumeMl <= 0.0f) {
     Serial.println(F("[ERR] Target volume must be > 0 mL"));
@@ -404,8 +443,7 @@ void startInfusion() {
     return;
   }
 
-  float rpmRequired = infusion.flowRateMlPerMin / VOLUME_PER_OUTPUT_REV_ML;
-  float radPerSecRequired = rpmRequired * 2.0f * PI / 60.0f;
+  updateInfusionSetpoint();
 
   portENTER_CRITICAL(&encoderMux);
   infusion.pulsesAtStartOfInfusion = encoderPulses;
@@ -415,11 +453,12 @@ void startInfusion() {
   infusion.infusing = true;
   infusion.infusionStartMs = millis();
 
-  pid.setpointRadPerSec = radPerSecRequired;
-  ss.setpointRadPerSec = radPerSecRequired;
   motor.running = true;
-  controlMode = ControlMode::PID;
-  resetPidState();
+  if (infusionControlMode == InfusionControlMode::PID) {
+    setControlMode(ControlMode::PID);
+  } else {
+    setControlMode(ControlMode::SS);
+  }
   armCurrentFaultMonitor();
   applyMotor();
 
@@ -428,8 +467,10 @@ void startInfusion() {
   Serial.print(F(" mL at "));
   Serial.print(infusion.flowRateMlPerMin, 2);
   Serial.print(F(" mL/min (RPM: "));
-  Serial.print(rpmRequired, 2);
-  Serial.println(F(")"));
+  Serial.print(infusion.targetRpm, 2);
+  Serial.print(F(") ["));
+  Serial.print(infusionControlModeName());
+  Serial.println(F("]"));
 }
 
 void stopInfusion() {
@@ -444,6 +485,8 @@ void stopInfusion() {
 void resetInfusionState() {
   infusion.targetVolumeMl = 0.0f;
   infusion.flowRateMlPerMin = 0.0f;
+  infusion.targetRpm = 0.0f;
+  infusion.targetRadPerSec = 0.0f;
   infusion.volumeInjectedMl = 0.0f;
   infusion.pulsesAtStartOfInfusion = 0;
   infusion.infusing = false;
@@ -566,12 +609,33 @@ void processCommand(const String& raw) {
   } else if (cmd.startsWith(F("FLOW "))) {
     float flow = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
     infusion.flowRateMlPerMin = flow;
+    updateInfusionSetpoint();
     Serial.print(F("[OK] Flow rate set to "));
     Serial.print(infusion.flowRateMlPerMin, 2);
-    Serial.println(F(" mL/min"));
+    Serial.print(F(" mL/min | speed setpoint = "));
+    Serial.print(infusion.targetRpm, 2);
+    Serial.println(F(" RPM"));
 
-  } else if (cmd == F("INFUSE") || cmd == F("INJECT")) {
+  } else if (cmd.startsWith(F("INFUSE")) || cmd.startsWith(F("INJECT"))) {
+    int spaceIndex = cmd.indexOf(' ');
+    if (spaceIndex > 0) {
+      String mode = cmd.substring(spaceIndex + 1);
+      mode.trim();
+      if (mode == F("PID")) {
+        setInfusionControlMode(InfusionControlMode::PID);
+      } else if (mode == F("SS")) {
+        setInfusionControlMode(InfusionControlMode::SS);
+      }
+    }
     startInfusion();
+
+  } else if (cmd == F("INFMODE PID") || cmd == F("INFUSION PID")) {
+    setInfusionControlMode(InfusionControlMode::PID);
+    Serial.println(F("[OK] Infusion controller -> PID"));
+
+  } else if (cmd == F("INFMODE SS") || cmd == F("INFUSION SS")) {
+    setInfusionControlMode(InfusionControlMode::SS);
+    Serial.println(F("[OK] Infusion controller -> SS"));
 
   } else if (cmd == F("MODE MANUAL") || cmd == F("MANUAL")) {
     setControlMode(ControlMode::Manual);
@@ -844,7 +908,8 @@ void printHelp() {
   Serial.println(F("║  INFUSION COMMANDS:                            ║"));
   Serial.println(F("║  VOL <mL>     Set target infusion volume       ║"));
   Serial.println(F("║  FLOW <mL/m>  Set infusion flow rate           ║"));
-  Serial.println(F("║  INFUSE       Start infusion (auto-stop)       ║"));
+  Serial.println(F("║  INFUSE [PID|SS] Start infusion (auto-stop)    ║"));
+  Serial.println(F("║  INFMODE PID/SS Set default infusion controller ║"));
   Serial.println(F("║                                                ║"));
   Serial.println(F("║  CONTROL MODES:                                ║"));
   Serial.println(F("║  S <0-255>    Set PWM speed                    ║"));
