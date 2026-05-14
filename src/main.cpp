@@ -407,8 +407,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       data: { 
         labels: [], 
         datasets: [
-          { label: 'Trace A', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0 },
-          { label: 'Trace B', borderColor: '#2ecc71', data: [], tension: 0.1, pointRadius: 0 }
+          { label: 'Trace A', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
+          { label: 'Trace B', borderColor: '#2ecc71', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
         ] 
       },
       options: { 
@@ -416,8 +416,17 @@ const char index_html[] PROGMEM = R"rawliteral(
         responsive: true,
         scales: {
           y: {
+            type: 'linear',
+            position: 'left',
             suggestedMin: -0.5,
             suggestedMax: 2.5
+          },
+          y1: {
+            type: 'linear',
+            position: 'right',
+            suggestedMin: -0.5,
+            suggestedMax: 2.5,
+            grid: { drawOnChartArea: false }
           }
         }
       }
@@ -428,8 +437,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       data: { 
         labels: [], 
         datasets: [
-          { label: 'Trace A', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0 },
-          { label: 'Trace B', borderColor: '#f1c40f', data: [], tension: 0.1, pointRadius: 0 }
+          { label: 'Trace A', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y' },
+          { label: 'Trace B', borderColor: '#f1c40f', data: [], tension: 0.1, pointRadius: 0, yAxisID: 'y1' }
         ] 
       },
       options: { 
@@ -437,8 +446,17 @@ const char index_html[] PROGMEM = R"rawliteral(
         responsive: true,
         scales: {
           y: {
+            type: 'linear',
+            position: 'left',
             suggestedMin: -0.5,
             suggestedMax: 2.5
+          },
+          y1: {
+            type: 'linear',
+            position: 'right',
+            suggestedMin: -0.5,
+            suggestedMax: 2.5,
+            grid: { drawOnChartArea: false }
           }
         }
       }
@@ -461,6 +479,16 @@ const char index_html[] PROGMEM = R"rawliteral(
       const g1B = document.getElementById('g1B').value;
       const g2A = document.getElementById('g2A').value;
       const g2B = document.getElementById('g2B').value;
+
+      const isSameUnit = (a, b) => {
+        if ((a === 'rpm' || a === 'sp') && (b === 'rpm' || b === 'sp')) return true;
+        return a === b;
+      };
+
+      chart1.data.datasets[1].yAxisID = isSameUnit(g1A, g1B) ? 'y' : 'y1';
+      chart2.data.datasets[1].yAxisID = isSameUnit(g2A, g2B) ? 'y' : 'y1';
+      chart1.options.scales.y1.display = !isSameUnit(g1A, g1B) && g1B !== "none";
+      chart2.options.scales.y1.display = !isSameUnit(g2A, g2B) && g2B !== "none";
 
       if (chart1.data.labels.length > maxPoints) {
         chart1.data.labels.shift(); 
@@ -726,7 +754,7 @@ void broadcastTelemetry(float amps) {
   doc["volI"] = infusion.volumeInjectedMl;
   doc["volT"] = infusion.targetVolumeMl;
   doc["flt"]  = currentFault.latched;
-  doc["pwm"]  = motor.pwm;
+  doc["pwm"]  = motor.running ? motor.pwm : 0;
   
   String out;
   serializeJson(doc, out);
