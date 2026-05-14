@@ -7,8 +7,8 @@
 // ─────────────────────────────────────────────
 //  WIFI & WEB SERVER CONFIGURATION
 // ─────────────────────────────────────────────
-const char* ssid = "SSID";
-const char* password = "PASSWORD";
+const char* ssid = "BioFlow";
+const char* password = "Maincra123";
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -129,8 +129,10 @@ struct InfusionState {
   float targetRpm = 0.0f;               // Calculated infusion speed [RPM]
   float targetRadPerSec = 0.0f;         // Calculated infusion speed [rad/s]
   float volumeInjectedMl = 0.0f;        // Volume injected so far [mL]
+  float baseVolumeInjectedMl = 0.0f;    // Volume injected before a pause [mL]
   long pulsesAtStartOfInfusion = 0;     // Encoder pulses when infusion started
   bool infusing = false;                // Whether currently infusing
+  bool paused = false;                  // Whether infusion is paused
   uint32_t infusionStartMs = 0;         // When infusion started
 } infusion;
 
@@ -248,10 +250,21 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
         <button class="btn" onclick="sendCmd('FLOW ' + document.getElementById('flowIn').value)">Set Flow Rate</button>
       </div>
+      <div>
+        <div class="form-group">
+          <label>Infusion Profile Mode</label>
+          <select id="infModeSelect" style="width: 100%; padding: 10px;" onchange="sendCmd('INFUSE_MODE ' + this.value)">
+            <option value="PID">PID closed-loop</option>
+            <option value="SS">State-Space</option>
+          </select>
+        </div>
+      </div>
     </div>
     <div class="card" style="text-align: center;">
-      <button class="btn btn-success" style="font-size: 20px; padding: 15px 40px;" onclick="sendCmd('INFUSE')">▶ START INFUSION</button>
-      <button class="btn btn-danger" style="font-size: 20px; padding: 15px 40px;" onclick="sendCmd('STOP')">⏹ STOP</button>
+      <button id="btnStart" class="btn btn-success" style="font-size: 20px; padding: 15px 40px;" onclick="sendCmd('INFUSE')">▶ START INFUSION</button>
+      <button id="btnPause" class="btn btn-danger" style="display: none; font-size: 20px; padding: 15px 40px;" onclick="sendCmd('PAUSE')">⏸ PAUSE</button>
+      <button id="btnResume" class="btn btn-success" style="display: none; font-size: 20px; padding: 15px 40px;" onclick="sendCmd('RESUME')">▶ RESUME</button>
+      <button id="btnReset" class="btn btn-danger" style="display: none; font-size: 20px; padding: 15px 40px;" onclick="sendCmd('STOP_INFUSION')">⏹ RESET</button>
       
       <div class="progress-bar-container">
         <div class="progress-bar" id="progressBar"></div>
@@ -261,8 +274,55 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
 
   <div id="plotting" class="tab-content">
-    <canvas id="rpmChart" height="100"></canvas>
-    <canvas id="currentChart" height="100"></canvas>
+    <div style="margin-bottom: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+      <div>
+        <label>Graph 1 (Main):</label>
+        <select id="g1A" onchange="clearCharts()" style="width:100%; padding:5px;">
+          <option value="rpm">RPM Actual</option>
+          <option value="sp">RPM Setpoint</option>
+          <option value="I">Current (A)</option>
+          <option value="volI">Volume Injected (mL)</option>
+          <option value="pwm">Motor PWM</option>
+        </select>
+      </div>
+      <div>
+        <label>Graph 1 (Secondary):</label>
+        <select id="g1B" onchange="clearCharts()" style="width:100%; padding:5px;">
+          <option value="none" selected>None</option>
+          <option value="rpm">RPM Actual</option>
+          <option value="sp">RPM Setpoint</option>
+          <option value="I">Current (A)</option>
+          <option value="volI">Volume Injected (mL)</option>
+          <option value="pwm">Motor PWM</option>
+        </select>
+      </div>
+    </div>
+    <canvas id="chart1" height="100"></canvas>
+
+    <div style="margin-bottom: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+      <div>
+        <label>Graph 2 (Main):</label>
+        <select id="g2A" onchange="clearCharts()" style="width:100%; padding:5px;">
+          <option value="I" selected>Current (A)</option>
+          <option value="rpm">RPM Actual</option>
+          <option value="sp">RPM Setpoint</option>
+          <option value="volI">Volume Injected (mL)</option>
+          <option value="pwm">Motor PWM</option>
+        </select>
+      </div>
+      <div>
+        <label>Graph 2 (Secondary):</label>
+        <select id="g2B" onchange="clearCharts()" style="width:100%; padding:5px;">
+          <option value="none" selected>None</option>
+          <option value="I">Current (A)</option>
+          <option value="rpm">RPM Actual</option>
+          <option value="sp">RPM Setpoint</option>
+          <option value="volI">Volume Injected (mL)</option>
+          <option value="pwm">Motor PWM</option>
+        </select>
+      </div>
+    </div>
+    <canvas id="chart2" height="100"></canvas>
   </div>
 
   <div id="config" class="tab-content">
@@ -339,47 +399,105 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     // Chart.js Setup
     const maxPoints = 50;
-    const ctxRpm = document.getElementById('rpmChart').getContext('2d');
-    const ctxCurrent = document.getElementById('currentChart').getContext('2d');
+    const ctx1 = document.getElementById('chart1').getContext('2d');
+    const ctx2 = document.getElementById('chart2').getContext('2d');
 
-    const rpmChart = new Chart(ctxRpm, {
+    const chart1 = new Chart(ctx1, {
       type: 'line',
-      data: {
-        labels: [],
+      data: { 
+        labels: [], 
         datasets: [
-          { label: 'RPM Actual', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0 },
-          { label: 'RPM Setpoint', borderColor: '#2ecc71', data: [], borderDash: [5, 5], pointRadius: 0 }
-        ]
+          { label: 'Trace A', borderColor: '#3498db', data: [], tension: 0.1, pointRadius: 0 },
+          { label: 'Trace B', borderColor: '#2ecc71', data: [], tension: 0.1, pointRadius: 0 }
+        ] 
       },
-      options: { animation: false, responsive: true, scales: { y: { beginAtZero: true, title: {display:true, text:'RPM'} } } }
-    });
-
-    const currentChart = new Chart(ctxCurrent, {
-      type: 'line',
-      data: {
-        labels: [],
-        datasets: [{ label: 'Motor Current (A)', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0 }]
-      },
-      options: { animation: false, responsive: true, scales: { y: { beginAtZero: true, title: {display:true, text:'Amps'} } } }
-    });
-
-    function updateCharts(t, rpm, sp, current) {
-      const timeStr = (t / 1000).toFixed(1) + "s";
-      if (rpmChart.data.labels.length > maxPoints) {
-        rpmChart.data.labels.shift();
-        rpmChart.data.datasets[0].data.shift();
-        rpmChart.data.datasets[1].data.shift();
-        currentChart.data.labels.shift();
-        currentChart.data.datasets[0].data.shift();
+      options: { 
+        animation: false, 
+        responsive: true,
+        scales: {
+          y: {
+            suggestedMin: -0.5,
+            suggestedMax: 2.5
+          }
+        }
       }
-      rpmChart.data.labels.push(timeStr);
-      rpmChart.data.datasets[0].data.push(rpm);
-      rpmChart.data.datasets[1].data.push(sp);
-      rpmChart.update();
+    });
 
-      currentChart.data.labels.push(timeStr);
-      currentChart.data.datasets[0].data.push(current);
-      currentChart.update();
+    const chart2 = new Chart(ctx2, {
+      type: 'line',
+      data: { 
+        labels: [], 
+        datasets: [
+          { label: 'Trace A', borderColor: '#e74c3c', data: [], tension: 0.1, pointRadius: 0 },
+          { label: 'Trace B', borderColor: '#f1c40f', data: [], tension: 0.1, pointRadius: 0 }
+        ] 
+      },
+      options: { 
+        animation: false, 
+        responsive: true,
+        scales: {
+          y: {
+            suggestedMin: -0.5,
+            suggestedMax: 2.5
+          }
+        }
+      }
+    });
+
+    function clearCharts() {
+      chart1.data.labels = []; 
+      chart1.data.datasets[0].data = []; 
+      chart1.data.datasets[1].data = []; 
+      chart1.update();
+      chart2.data.labels = []; 
+      chart2.data.datasets[0].data = []; 
+      chart2.data.datasets[1].data = []; 
+      chart2.update();
+    }
+
+    function updateCharts(data) {
+      const timeStr = (data.t / 1000).toFixed(1) + "s";
+      const g1A = document.getElementById('g1A').value;
+      const g1B = document.getElementById('g1B').value;
+      const g2A = document.getElementById('g2A').value;
+      const g2B = document.getElementById('g2B').value;
+
+      if (chart1.data.labels.length > maxPoints) {
+        chart1.data.labels.shift(); 
+        chart1.data.datasets[0].data.shift();
+        chart1.data.datasets[1].data.shift();
+        chart2.data.labels.shift(); 
+        chart2.data.datasets[0].data.shift();
+        chart2.data.datasets[1].data.shift();
+      }
+      
+      chart1.data.labels.push(timeStr);
+      chart1.data.datasets[0].label = document.getElementById('g1A').options[document.getElementById('g1A').selectedIndex].text;
+      chart1.data.datasets[0].data.push(data[g1A]);
+      
+      if (g1B !== "none") {
+        chart1.data.datasets[1].hidden = false;
+        chart1.data.datasets[1].label = document.getElementById('g1B').options[document.getElementById('g1B').selectedIndex].text;
+        chart1.data.datasets[1].data.push(data[g1B]);
+      } else {
+         chart1.data.datasets[1].hidden = true;
+         chart1.data.datasets[1].data.push(null);
+      }
+      chart1.update();
+
+      chart2.data.labels.push(timeStr);
+      chart2.data.datasets[0].label = document.getElementById('g2A').options[document.getElementById('g2A').selectedIndex].text;
+      chart2.data.datasets[0].data.push(data[g2A]);
+
+      if (g2B !== "none") {
+        chart2.data.datasets[1].hidden = false;
+        chart2.data.datasets[1].label = document.getElementById('g2B').options[document.getElementById('g2B').selectedIndex].text;
+        chart2.data.datasets[1].data.push(data[g2B]);
+      } else {
+         chart2.data.datasets[1].hidden = true;
+         chart2.data.datasets[1].data.push(null);
+      }
+      chart2.update();
     }
 
     // WebSocket Logic
@@ -413,15 +531,36 @@ const char index_html[] PROGMEM = R"rawliteral(
         if(data.flt) document.getElementById('modeStatus').style.background = "var(--danger)";
         else document.getElementById('modeStatus').style.background = "#7f8c8d";
 
-        // Update Infusion Progress
+        // Sync Infusion Buttons
         if (data.inf) {
+          document.getElementById('btnStart').style.display = 'none';
+          document.getElementById('btnPause').style.display = 'inline-block';
+          document.getElementById('btnResume').style.display = 'none';
+          document.getElementById('btnReset').style.display = 'inline-block';
+        } else if (data.paused) {
+          document.getElementById('btnStart').style.display = 'none';
+          document.getElementById('btnPause').style.display = 'none';
+          document.getElementById('btnResume').style.display = 'inline-block';
+          document.getElementById('btnReset').style.display = 'inline-block';
+        } else {
+          document.getElementById('btnStart').style.display = 'inline-block';
+          document.getElementById('btnPause').style.display = 'none';
+          document.getElementById('btnResume').style.display = 'none';
+          document.getElementById('btnReset').style.display = 'none';
+        }
+
+        // Update Infusion Progress
+        if (data.inf || data.paused) {
           const pct = Math.min(100, (data.volI / data.volT) * 100);
           document.getElementById('progressBar').style.width = pct + "%";
           document.getElementById('progressText').innerText = data.volI.toFixed(2) + " / " + data.volT.toFixed(2) + " mL";
+        } else {
+          document.getElementById('progressBar').style.width = "0%";
+          document.getElementById('progressText').innerText = "0.00 / 0.00 mL";
         }
 
         // Plotting
-        updateCharts(data.t, data.rpm, data.sp, data.I);
+        updateCharts(data);
       }
     }
 
@@ -583,9 +722,11 @@ void broadcastTelemetry(float amps) {
   doc["I"]    = amps;
   doc["mode"] = controlModeName();
   doc["inf"]  = infusion.infusing;
+  doc["paused"] = infusion.paused;
   doc["volI"] = infusion.volumeInjectedMl;
   doc["volT"] = infusion.targetVolumeMl;
   doc["flt"]  = currentFault.latched;
+  doc["pwm"]  = motor.pwm;
   
   String out;
   serializeJson(doc, out);
@@ -712,10 +853,11 @@ void updateInfusionControl() {
   portEXIT_CRITICAL(&encoderMux);
 
   long deltaPulses = currentPulses - infusion.pulsesAtStartOfInfusion;
-  infusion.volumeInjectedMl = (float)deltaPulses * VOLUME_PER_OUTPUT_REV_ML / PULSES_PER_OUTPUT_REV;
+  infusion.volumeInjectedMl = infusion.baseVolumeInjectedMl + ((float)deltaPulses * VOLUME_PER_OUTPUT_REV_ML / PULSES_PER_OUTPUT_REV);
 
   if (infusion.volumeInjectedMl >= infusion.targetVolumeMl) {
     stopInfusion();
+    infusion.paused = false;
     logMessage("[INFO] Infusion complete. Vol: " + String(infusion.volumeInjectedMl, 2) + " mL");
   }
 }
@@ -757,8 +899,10 @@ void startInfusion() {
   infusion.pulsesAtStartOfInfusion = encoderPulses;
   portEXIT_CRITICAL(&encoderMux);
 
+  infusion.baseVolumeInjectedMl = 0.0f;
   infusion.volumeInjectedMl = 0.0f;
   infusion.infusing = true;
+  infusion.paused = false;
   infusion.infusionStartMs = millis();
 
   motor.running = true;
@@ -773,8 +917,43 @@ void startInfusion() {
   logMessage("[OK] Infusing: " + String(infusion.targetVolumeMl, 2) + "mL @ " + String(infusion.flowRateMlPerMin, 2) + " mL/min (RPM: " + String(infusion.targetRpm, 2) + ")");
 }
 
+void pauseInfusion() {
+  if (!infusion.infusing) return;
+  infusion.infusing = false;
+  infusion.paused = true;
+  infusion.baseVolumeInjectedMl = infusion.volumeInjectedMl;
+  motor.running = false;
+  pid.enabled = false;
+  controlMode = ControlMode::Manual;
+  stopMotor();
+  resetPidState();
+  logMessage("[OK] Infusion Paused.");
+}
+
+void resumeInfusion() {
+  if (!infusion.paused) return;
+  
+  portENTER_CRITICAL(&encoderMux);
+  infusion.pulsesAtStartOfInfusion = encoderPulses;
+  portEXIT_CRITICAL(&encoderMux);
+
+  infusion.infusing = true;
+  infusion.paused = false;
+
+  motor.running = true;
+  if (infusionControlMode == InfusionControlMode::PID) {
+    setControlMode(ControlMode::PID);
+  } else {
+    setControlMode(ControlMode::SS);
+  }
+  armCurrentFaultMonitor();
+  applyMotor();
+  logMessage("[OK] Infusion Resumed.");
+}
+
 void stopInfusion() {
   infusion.infusing = false;
+  infusion.paused = false;
   motor.running = false;
   pid.enabled = false;
   controlMode = ControlMode::Manual;
@@ -789,8 +968,10 @@ void resetInfusionState() {
   infusion.targetRpm = 0.0f;
   infusion.targetRadPerSec = 0.0f;
   infusion.volumeInjectedMl = 0.0f;
+  infusion.baseVolumeInjectedMl = 0.0f;
   infusion.pulsesAtStartOfInfusion = 0;
   infusion.infusing = false;
+  infusion.paused = false;
   infusion.infusionStartMs = 0;
 }
 
@@ -920,7 +1101,12 @@ void processCommand(const String& raw) {
     logMessage("[OK] Flow Rate: " + String(infusion.flowRateMlPerMin, 2) + " mL/min");
 
   } else if (cmd == "INFUSE") { startInfusion();
-  } else if (cmd == "MODE MANUAL") { setControlMode(ControlMode::Manual); stopMotor(); logMessage("[OK] Mode -> MANUAL");
+  } else if (cmd == "PAUSE") { pauseInfusion();
+  } else if (cmd == "RESUME") { resumeInfusion();
+  } else if (cmd == "STOP_INFUSION") { stopInfusion();
+  } else if (cmd == "INFUSE_MODE PID") { setInfusionControlMode(InfusionControlMode::PID); logMessage("[OK] Infusion Mode -> PID");
+  } else if (cmd == "INFUSE_MODE SS") { setInfusionControlMode(InfusionControlMode::SS); logMessage("[OK] Infusion Mode -> SS");
+  } else if (cmd == "MODE MANUAL") { setControlMode(ControlMode::Manual); stopMotor(); motor.running = false; infusion.infusing = false; infusion.paused = false; logMessage("[OK] Mode -> MANUAL");
   } else if (cmd == "MODE PID") { setControlMode(ControlMode::PID); motor.running = true; armCurrentFaultMonitor(); applyMotor(); logMessage("[OK] Mode -> PID");
   } else if (cmd == "MODE SS") { setControlMode(ControlMode::SS); motor.running = true; armCurrentFaultMonitor(); applyMotor(); logMessage("[OK] Mode -> SS");
   } else if (cmd.startsWith("S ")) {
@@ -935,14 +1121,14 @@ void processCommand(const String& raw) {
   } else if (cmd == "FWD") { motor.forward = true; if(motor.running) applyMotor(); logMessage("[OK] Dir -> FWD");
   } else if (cmd == "REV") { motor.forward = false; if(motor.running) applyMotor(); logMessage("[OK] Dir -> REV");
   } else if (cmd == "GO") { motor.running = true; armCurrentFaultMonitor(); applyMotor(); logMessage("[OK] Motor Start");
-  } else if (cmd == "STOP") { motor.running = false; stopMotor(); infusion.infusing = false; logMessage("[OK] Motor Stop");
+  } else if (cmd == "STOP") { motor.running = false; stopMotor(); infusion.infusing = false; infusion.paused = false; pid.enabled = false; logMessage("[OK] Motor Stop");
   } else if (cmd == "RESET") {
     stopMotor(); motor.pwm = 0; motor.forward = true; motor.running = false;
     portENTER_CRITICAL(&encoderMux); encoderPulses = 0; portEXIT_CRITICAL(&encoderMux);
     resetPidState(); resetSsState(); resetInfusionState(); resetCurrentFaultState();
     logMessage("[OK] System Reset & Encoder Zeroed");
   } else if (cmd == "STBY ON") { digitalWrite(PIN_STBY, HIGH); logMessage("[OK] Driver ON");
-  } else if (cmd == "STBY OFF") { digitalWrite(PIN_STBY, LOW); logMessage("[OK] Driver OFF");
+  } else if (cmd == "STBY OFF") { motor.running = false; stopMotor(); infusion.infusing = false; infusion.paused = false; pid.enabled = false; digitalWrite(PIN_STBY, LOW); logMessage("[OK] Driver OFF (Motor Stopped)");
   } else {
     logMessage("[?] Unknown Command: " + raw);
   }
