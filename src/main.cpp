@@ -7,8 +7,8 @@
 // ─────────────────────────────────────────────
 //  WIFI & WEB SERVER CONFIGURATION
 // ─────────────────────────────────────────────
-const char* ssid = "BioFlow";
-const char* password = "Maincra123";
+const char* ssid = "SSID";
+const char* password = "Password";
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -231,9 +231,9 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div class="tabs">
     <button class="tablink active" onclick="openTab(event, 'infusion')">Infusion</button>
     <button class="tablink" onclick="openTab(event, 'plotting')">Plotting</button>
-    <button class="tablink" onclick="openTab(event, 'config')">Config</button>
-    <button class="tablink" onclick="openTab(event, 'calibration')">Calibration</button>
-    <button class="tablink" onclick="openTab(event, 'logs')">Sys Logs</button>
+    <button class="tablink" onclick="openTab(event, 'config')">Manual Config & Safety Limits</button>
+    <button class="tablink" onclick="openTab(event, 'manual')">Manual Control & Reset</button>
+    <button class="tablink" onclick="openTab(event, 'logs')">System Logs</button>
   </div>
 
   <div id="infusion" class="tab-content" style="display:block;">
@@ -375,7 +375,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <div id="calibration" class="tab-content">
+  <div id="manual" class="tab-content">
     <div class="card text-center">
       <h3>Jog & Alignment</h3>
       <button class="btn" onclick="sendCmd('FWD')">Direction: FORWARD</button>
@@ -388,6 +388,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       <button class="btn" onclick="sendCmd('STBY OFF')">Disable Driver (STBY LOW)</button>
       <hr>
       <button class="btn btn-danger" onclick="sendCmd('RESET')">SYSTEM RESET & ZERO ENCODER</button>
+      <hr>
+      <button class="btn btn-danger" onclick="sendCmd('REBOOT')">REBOOT ESP32</button>
     </div>
   </div>
 
@@ -396,7 +398,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       <h3>System Console</h3>
       <textarea id="logView" readonly></textarea>
       <br><br>
-      <input type="text" id="cmdInput" placeholder="Send manual command (e.g. HELP)" style="width: calc(100% - 100px); display:inline-block;">
+      <input type="text" id="cmdInput" placeholder="Send manual command" style="width: calc(100% - 100px); display:inline-block;">
       <button class="btn" onclick="sendCmd(document.getElementById('cmdInput').value)">Send</button>
     </div>
   </div>
@@ -522,10 +524,14 @@ const char index_html[] PROGMEM = R"rawliteral(
       };
 
       const isCurrentAxis = (v) => v === 'I' || v === 'I_lim_H' || v === 'I_lim_L';
-      chart1.options.scales.y.suggestedMax  = isCurrentAxis(g1A) ? 1.5 : 2.5;
-      chart1.options.scales.y1.suggestedMax = isCurrentAxis(g1B) ? 1.5 : 2.5;
-      chart2.options.scales.y.suggestedMax  = isCurrentAxis(g2A) ? 1.5 : 2.5;
-      chart2.options.scales.y1.suggestedMax = isCurrentAxis(g2B) ? 1.5 : 2.5;
+      chart1.options.scales.y.suggestedMin  = isCurrentAxis(g1A) ? -0.1 : -0.5;
+      chart1.options.scales.y.suggestedMax  = isCurrentAxis(g1A) ? 1.0 : 2.5;
+      chart1.options.scales.y1.suggestedMin = isCurrentAxis(g1B) ? -0.1 : -0.5;
+      chart1.options.scales.y1.suggestedMax = isCurrentAxis(g1B) ? 1.0 : 2.5;
+      chart2.options.scales.y.suggestedMin  = isCurrentAxis(g2A) ? -0.1 : -0.5;
+      chart2.options.scales.y.suggestedMax  = isCurrentAxis(g2A) ? 1.0 : 2.5;
+      chart2.options.scales.y1.suggestedMin = isCurrentAxis(g2B) ? -0.1 : -0.5;
+      chart2.options.scales.y1.suggestedMax = isCurrentAxis(g2B) ? 1.0 : 2.5;
 
       chart1.data.datasets[1].yAxisID = isSameUnit(g1A, g1B) ? 'y' : 'y1';
       chart2.data.datasets[1].yAxisID = isSameUnit(g2A, g2B) ? 'y' : 'y1';
@@ -1181,7 +1187,7 @@ float readADC() {
 
 float readCurrentAmps() {
   float adcMV = readADC();
-  return (ACS712_ZERO_ADC_MV - adcMV) / ACS712_SENS_MV_A;
+  return (ACS712_ZERO_ADC_MV - adcMV) / ACS712_SENS_MV_A - 1.05f; // Subtract 1A to roughly zero out the bad reading on the ADC
 }
 
 // ═════════════════════════════════════════════
@@ -1190,6 +1196,11 @@ float readCurrentAmps() {
 void processCommand(const String& raw) {
   String cmd = raw;
   cmd.toUpperCase();
+
+  if (currentFault.latched && cmd != "RESET") {
+    logMessage("[LOCKOUT] Press SYSTEM RESET to clear occlusion lockout.");
+    return;
+  }
 
   if (cmd.startsWith("OC ")) {
     int firstSpace = cmd.indexOf(' ');
@@ -1236,6 +1247,10 @@ void processCommand(const String& raw) {
     portENTER_CRITICAL(&encoderMux); encoderPulses = 0; portEXIT_CRITICAL(&encoderMux);
     resetPidState(); resetSsState(); resetInfusionState(); resetCurrentFaultState();
     logMessage("[OK] System Reset & Encoder Zeroed");
+  } else if (cmd == "REBOOT") {
+    logMessage("[INFO] Rebooting ESP32...");
+    delay(500);
+    ESP.restart();
   } else if (cmd == "STBY ON") { digitalWrite(PIN_STBY, HIGH); logMessage("[OK] Driver ON");
   } else if (cmd == "STBY OFF") { motor.running = false; stopMotor(); infusion.infusing = false; infusion.paused = false; pid.enabled = false; digitalWrite(PIN_STBY, LOW); logMessage("[OK] Driver OFF (Motor Stopped)");
   } else {
