@@ -32,7 +32,7 @@ AsyncWebSocket ws("/ws");
 #define LEDC_RESOLUTION 8
 
 // ─────────────────────────────────────────────
-//  CONSTANTS (Sensors, Gearbox, Timing, PID)
+//  CURRENT SENSOR
 // ─────────────────────────────────────────────
 static constexpr float ACS712_ZERO_ADC_MV = 1260.0f;
 static constexpr float ACS712_SENS_MV_A   =   97.04f;
@@ -40,19 +40,32 @@ static constexpr float ADC_REF_MV         = 3300.0f;
 static constexpr float ADC_RESOLUTION     = 4095.0f;
 static constexpr int   CURRENT_SAMPLES    = 30;
 
+// ─────────────────────────────────────────────
+//  MOTOR & CONTROL CONFIGURATION
+// ─────────────────────────────────────────────
 static constexpr float PULSES_PER_MOTOR_REV = 11.0f;
 static constexpr float GEAR_RATIO           = 472.7272f;
 static constexpr int   ENC_EDGES_PER_PULSE  = 2;
 static constexpr float PULSES_PER_OUTPUT_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO * ENC_EDGES_PER_PULSE;
 
+// ─────────────────────────────────────────────
+//  CONTROL LOOP & TELEMETRY CONFIGURATION
+// ─────────────────────────────────────────────
 static constexpr uint32_t SPEED_UPDATE_MS   = 20;
 static constexpr float    EMA_ALPHA         = 0.05f;
+
 
 static constexpr uint32_t WEB_TELEMETRY_MS = 100; // 10Hz updates for the Web UI
 static uint32_t lastWebTelemetry = 0;
 
+// ─────────────────────────────────────────────
+//  Rad/s to RPM conversion constant
+// ─────────────────────────────────────────────
 static constexpr float RAD_PER_SEC_TO_RPM = 60.0f / (2.0f * PI);
 
+// ─────────────────────────────────────────────
+//  PID & State-Space Controller Constants
+// ─────────────────────────────────────────────
 static constexpr float PID_KC = 134.345399f;
 static constexpr float PID_TI = 0.110091f;
 static constexpr float PID_TD = 0.036606f;
@@ -63,9 +76,15 @@ static constexpr float SS_K_CURRENT  = 57.986618f;
 static constexpr float SS_K_INTEGRAL = -1220.314070f;
 static constexpr float SS_K_FF       = 0.039477f;
 
+// ─────────────────────────────────────────────
+//  PWM LIMITS
+// ─────────────────────────────────────────────
 static constexpr float PWM_MIN = 0.0f;
 static constexpr float PWM_MAX = 255.0f;
 
+// ─────────────────────────────────────────────
+//  CURRENT FAULT DETECTION CONFIGURATION
+// ─────────────────────────────────────────────
 static constexpr uint32_t CONTROL_PERIOD_MS = 50;
 static constexpr uint32_t CURRENT_CHECK_MS = 20;
 static constexpr uint32_t CURRENT_FAULT_ARM_MS = 300;
@@ -74,6 +93,9 @@ static constexpr float    CURRENT_FAULT_PERCENT = 0.30f;
 static constexpr float    CURRENT_FAULT_BASELINE_ALPHA = 0.0005f;
 static constexpr float    CURRENT_FAULT_MIN_BASELINE_A = 0.05f;
 
+// ─────────────────────────────────────────────
+//  SYRINGE & INFUSION CALCULATIONS
+// ─────────────────────────────────────────────
 static constexpr float SYRINGE_DIAMETER_MM = 29.0f;           
 static constexpr float SCREW_PITCH_TURNS_PER_INCH = 13.0f;    
 static constexpr float MM_PER_INCH = 25.4f;
@@ -81,6 +103,9 @@ static constexpr float MM_PER_SCREW_TURN = MM_PER_INCH / SCREW_PITCH_TURNS_PER_I
 static constexpr float SYRINGE_AREA_MM2 = (SYRINGE_DIAMETER_MM / 2.0f) * (SYRINGE_DIAMETER_MM / 2.0f) * PI;
 static constexpr float VOLUME_PER_OUTPUT_REV_ML = (SYRINGE_AREA_MM2 * MM_PER_SCREW_TURN) / 1000.0f;
 
+// ─────────────────────────────────────────────
+//  CONTROL MODES
+// ─────────────────────────────────────────────
 enum class ControlMode { Manual, PID, SS };
 
 enum class InfusionControlMode {
@@ -837,7 +862,7 @@ void broadcastTelemetry(float amps) {
 }
 
 // ═════════════════════════════════════════════
-//  CONTROL LOOPS (Kept exactly identical)
+//  CONTROL LOOPS
 // ═════════════════════════════════════════════
 void updateSpeedRadPerSec() {
   uint32_t now = millis();
@@ -1191,7 +1216,7 @@ float readCurrentAmps() {
 }
 
 // ═════════════════════════════════════════════
-//  COMMAND PARSER (Modified to use WebLogger)
+//  COMMAND PARSER - WebLogger and Serial
 // ═════════════════════════════════════════════
 void processCommand(const String& raw) {
   String cmd = raw;
