@@ -160,7 +160,16 @@ struct InfusionState {
   bool infusing = false;                // Whether currently infusing
   bool paused = false;                  // Whether infusion is paused
   uint32_t infusionStartMs = 0;         // When infusion started
+  float cumulativeIAE = 0.0f;           // Integral of Absolute Error during infusion
+  float cumulativeITAE = 0.0f;          // Integral of Time-weighted Absolute Error
+  uint32_t lastErrorCalcMs = 0;         // Last time error was calculated
 } infusion;
+
+struct InfusionMetrics {
+  float IAE = 0.0f;
+  float ITAE = 0.0f;
+  uint32_t timestampMs = 0;
+} metricsHistory[2] = {};
 
 InfusionControlMode infusionControlMode = InfusionControlMode::PID;
 
@@ -202,6 +211,7 @@ const __FlashStringHelper* infusionControlModeName();
 void  startInfusion();
 void  stopInfusion();
 void  resetInfusionState();
+void  updateInfusionMetrics();
 void  broadcastTelemetry(float amps);
 void  IRAM_ATTR encoderISR();
 
@@ -258,6 +268,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <button class="tablink" onclick="openTab(event, 'plotting')">Plotting</button>
     <button class="tablink" onclick="openTab(event, 'manual')">Manual Config & Control</button>
     <button class="tablink" onclick="openTab(event, 'safety')">Safety Limits & Reset</button>
+    <button class="tablink" onclick="openTab(event, 'metrics')">Performance Metrics</button>
     <button class="tablink" onclick="openTab(event, 'logs')">System Logs</button>
   </div>
 
@@ -420,6 +431,20 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
+  <div id="metrics" class="tab-content">
+    <div class="card">
+      <h3>Performance Metrics</h3>
+      <canvas id="metricsChart1" height="100"></canvas>
+      <p id="iaeFinal" style="text-align: center; margin-top: 10px; font-weight: bold;">Final IAE: --</p>
+      <p style="text-align: center; margin-top: 20px; font-weight: bold;">Integral of Absolute Error (IAE) - Last 2 Infusions</p>
+    </div>
+    <div class="card" style="margin-top: 30px;">
+      <canvas id="metricsChart2" height="100"></canvas>
+      <p id="itaeFinal" style="text-align: center; margin-top: 10px; font-weight: bold;">Final ITAE: --</p>
+      <p style="text-align: center; margin-top: 20px; font-weight: bold;">Integral of Time-weighted Absolute Error (ITAE) - Last 2 Infusions</p>
+    </div>
+  </div>
+
   <div id="logs" class="tab-content">
     <div class="card">
       <h3>System Console</h3>
@@ -443,6 +468,149 @@ const char index_html[] PROGMEM = R"rawliteral(
     const maxPoints = 50;
     let chart1 = null;
     let chart2 = null;
+    let metricsChart1 = null;
+    let metricsChart2 = null;
+    const metricsMaxPoints = 600;
+
+    let infusionSessionActive = false;
+    let liveInfusionTrace = { startMs: 0, lastSampleMs: 0, iae: 0, itae: 0, iaeSeries: [], itaeSeries: [] };
+    let lastInfusionTrace = { iaeSeries: [], itaeSeries: [] };
+    let previousInfusionTrace = { iaeSeries: [], itaeSeries: [] };
+
+    const clonePoints = (points) => points.map(p => ({ x: p.x, y: p.y }));
+    const finalY = (points) => (points && points.length ? points[points.length - 1].y : null);
+    const fmtFinal = (v) => (v === null ? '--' : v.toFixed(3));
+
+    function resetLiveInfusionTrace(startMs) {
+      liveInfusionTrace = {
+        startMs: startMs,
+        lastSampleMs: 0,
+        iae: 0,
+        itae: 0,
+        iaeSeries: [{ x: 0, y: 0 }],
+        itaeSeries: [{ x: 0, y: 0 }]
+      };
+    }
+
+    function finalizeLiveInfusionTrace() {
+      if (liveInfusionTrace.iaeSeries.length < 2) return;
+      previousInfusionTrace = {
+        iaeSeries: clonePoints(lastInfusionTrace.iaeSeries),
+        itaeSeries: clonePoints(lastInfusionTrace.itaeSeries)
+      };
+      lastInfusionTrace = {
+        iaeSeries: clonePoints(liveInfusionTrace.iaeSeries),
+        itaeSeries: clonePoints(liveInfusionTrace.itaeSeries)
+      };
+    }
+
+    function processMetricsTelemetry(data) {
+      const sessionActive = data.inf || data.paused;
+
+      if (sessionActive && !infusionSessionActive) {
+        resetLiveInfusionTrace(data.t);
+      }
+
+      if (sessionActive) {
+        if (data.inf) {
+          if (liveInfusionTrace.lastSampleMs === 0) {
+            liveInfusionTrace.lastSampleMs = data.t;
+          }
+
+          let dtMs = data.t - liveInfusionTrace.lastSampleMs;
+          if (dtMs < 0 || dtMs > 2000) dtMs = 0;
+          const dtSec = dtMs / 1000.0;
+
+          const elapsedSec = Math.max(0, (data.t - liveInfusionTrace.startMs) / 1000.0);
+          const absError = Math.abs((data.sp || 0) - (data.rpm || 0));
+
+          liveInfusionTrace.iae += absError * dtSec;
+          liveInfusionTrace.itae += elapsedSec * absError * dtSec;
+
+          const lastIdx = liveInfusionTrace.iaeSeries.length - 1;
+          const lastX = lastIdx >= 0 ? liveInfusionTrace.iaeSeries[lastIdx].x : -1;
+          if (elapsedSec > lastX) {
+            liveInfusionTrace.iaeSeries.push({ x: elapsedSec, y: liveInfusionTrace.iae });
+            liveInfusionTrace.itaeSeries.push({ x: elapsedSec, y: liveInfusionTrace.itae });
+            if (liveInfusionTrace.iaeSeries.length > metricsMaxPoints) liveInfusionTrace.iaeSeries.shift();
+            if (liveInfusionTrace.itaeSeries.length > metricsMaxPoints) liveInfusionTrace.itaeSeries.shift();
+          }
+
+          liveInfusionTrace.lastSampleMs = data.t;
+        } else {
+          liveInfusionTrace.lastSampleMs = data.t;
+        }
+      } else if (!sessionActive && infusionSessionActive) {
+        finalizeLiveInfusionTrace();
+      }
+
+      infusionSessionActive = sessionActive;
+      updateMetricsCharts();
+    }
+
+    function initMetricsCharts() {
+      if (typeof Chart === 'undefined') return;
+      
+      const ctx1 = document.getElementById('metricsChart1').getContext('2d');
+      metricsChart1 = new Chart(ctx1, {
+        type: 'line',
+        data: {
+          datasets: [
+            { label: 'Current/Last Infusion', borderColor: '#3498db', data: [], tension: 0.15, pointRadius: 0 },
+            { label: 'Previous Infusion', borderColor: '#e74c3c', data: [], tension: 0.15, pointRadius: 0 }
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Infusion Time (s)' } },
+            y: { beginAtZero: true, title: { display: true, text: 'IAE' } }
+          },
+          plugins: { legend: { display: true, title: { display: true, text: 'Overlapping' } } }
+        }
+      });
+      
+      const ctx2 = document.getElementById('metricsChart2').getContext('2d');
+      metricsChart2 = new Chart(ctx2, {
+        type: 'line',
+        data: {
+          datasets: [
+            { label: 'Current/Last Infusion', borderColor: '#3498db', data: [], tension: 0.15, pointRadius: 0 },
+            { label: 'Previous Infusion', borderColor: '#e74c3c', data: [], tension: 0.15, pointRadius: 0 }
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Infusion Time (s)' } },
+            y: { beginAtZero: true, title: { display: true, text: 'ITAE' } }
+          },
+          plugins: { legend: { display: true, title: { display: true, text: 'Overlapping' } } }
+        }
+      });
+    }
+
+    function updateMetricsCharts() {
+      if (!metricsChart1 || !metricsChart2) return;
+      const primaryIAE = infusionSessionActive ? liveInfusionTrace.iaeSeries : lastInfusionTrace.iaeSeries;
+      const secondaryIAE = infusionSessionActive ? lastInfusionTrace.iaeSeries : previousInfusionTrace.iaeSeries;
+      const primaryITAE = infusionSessionActive ? liveInfusionTrace.itaeSeries : lastInfusionTrace.itaeSeries;
+      const secondaryITAE = infusionSessionActive ? lastInfusionTrace.itaeSeries : previousInfusionTrace.itaeSeries;
+
+      metricsChart1.data.datasets[0].data = clonePoints(primaryIAE);
+      metricsChart1.data.datasets[1].data = clonePoints(secondaryIAE);
+      metricsChart1.update();
+      metricsChart2.data.datasets[0].data = clonePoints(primaryITAE);
+      metricsChart2.data.datasets[1].data = clonePoints(secondaryITAE);
+      metricsChart2.update();
+
+      const iaeText = "Final IAE (Current/Last: " + fmtFinal(finalY(primaryIAE)) + ", Previous: " + fmtFinal(finalY(secondaryIAE)) + ")";
+      const itaeText = "Final ITAE (Current/Last: " + fmtFinal(finalY(primaryITAE)) + ", Previous: " + fmtFinal(finalY(secondaryITAE)) + ")";
+      document.getElementById('iaeFinal').innerText = iaeText;
+      document.getElementById('itaeFinal').innerText = itaeText;
+    }
 
     function initCharts() {
       if (typeof Chart === 'undefined') {
@@ -564,6 +732,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       chart2.data.datasets[1].yAxisID = isSameUnit(g2A, g2B) ? 'y' : 'y1';
       chart1.options.scales.y1.display = !isSameUnit(g1A, g1B) && g1B !== "none";
       chart2.options.scales.y1.display = !isSameUnit(g2A, g2B) && g2B !== "none";
+      
+      processMetricsTelemetry(data);
 
       if (chart1.data.labels.length > maxPoints) {
         chart1.data.labels.shift(); 
@@ -690,6 +860,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     window.onload = () => {
       initCharts();
+      initMetricsCharts();
       initWebSocket();
     };
   </script>
@@ -858,6 +1029,13 @@ void broadcastTelemetry(float amps) {
   doc["I_lim_L"] = tripL;
   doc["I_warn"] = currentFault.warningActive;
   
+  JsonArray metricsArray = doc["metricsHistory"].to<JsonArray>();
+  for (int i = 0; i < 2; i++) {
+    JsonObject m = metricsArray.add<JsonObject>();
+    m["IAE"] = metricsHistory[i].IAE;
+    m["ITAE"] = metricsHistory[i].ITAE;
+  }
+  
   String out;
   serializeJson(doc, out);
   ws.textAll(out);
@@ -984,8 +1162,32 @@ void updateCurrentFaultMonitor(float amps) {
   }
 }
 
+void updateInfusionMetrics() {
+  if (!infusion.infusing) return;
+  
+  uint32_t now = millis();
+  if (infusion.lastErrorCalcMs == 0) {
+    infusion.lastErrorCalcMs = now;
+    return;
+  }
+  
+  uint32_t dt_ms = now - infusion.lastErrorCalcMs;
+  float dt_sec = dt_ms / 1000.0f;
+  
+  float actualRpm = outputRadPerSec * RAD_PER_SEC_TO_RPM;
+  float setpointRpm = infusion.targetRpm;
+  float error = fabsf(setpointRpm - actualRpm);
+  
+  infusion.cumulativeIAE += error * dt_sec;
+  infusion.cumulativeITAE += (now / 1000.0f) * error * dt_sec;
+  
+  infusion.lastErrorCalcMs = now;
+}
+
 void updateInfusionControl() {
   if (!infusion.infusing) return;
+  
+  updateInfusionMetrics();
 
   portENTER_CRITICAL(&encoderMux);
   long currentPulses = encoderPulses;
@@ -995,6 +1197,10 @@ void updateInfusionControl() {
   infusion.volumeInjectedMl = infusion.baseVolumeInjectedMl + ((float)deltaPulses * VOLUME_PER_OUTPUT_REV_ML / PULSES_PER_OUTPUT_REV);
 
   if (infusion.volumeInjectedMl >= infusion.targetVolumeMl) {
+    metricsHistory[1] = metricsHistory[0];
+    metricsHistory[0].IAE = infusion.cumulativeIAE;
+    metricsHistory[0].ITAE = infusion.cumulativeITAE;
+    metricsHistory[0].timestampMs = millis();
     stopInfusion();
     infusion.paused = false;
     logMessage("[INFO] Infusion complete. Vol: " + String(infusion.volumeInjectedMl, 2) + " mL");
@@ -1040,6 +1246,9 @@ void startInfusion() {
 
   infusion.baseVolumeInjectedMl = 0.0f;
   infusion.volumeInjectedMl = 0.0f;
+  infusion.cumulativeIAE = 0.0f;
+  infusion.cumulativeITAE = 0.0f;
+  infusion.lastErrorCalcMs = 0;
   infusion.infusing = true;
   infusion.paused = false;
   infusion.infusionStartMs = millis();
@@ -1112,6 +1321,9 @@ void resetInfusionState() {
   infusion.infusing = false;
   infusion.paused = false;
   infusion.infusionStartMs = 0;
+  infusion.cumulativeIAE = 0.0f;
+  infusion.cumulativeITAE = 0.0f;
+  infusion.lastErrorCalcMs = 0;
 }
 
 float clampf(float value, float lowerBound, float upperBound) {
