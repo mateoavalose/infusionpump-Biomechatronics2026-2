@@ -214,7 +214,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BioFlow - Infusion Pump</title>
+  <title>BioFlow</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
   <style>
     :root { --bg: #f4f4f9; --nav: #2c3e50; --primary: #3498db; --text: #333; --panel: #fff; --danger: #e74c3c; --success: #2ecc71;}
@@ -245,7 +245,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <body>
 
   <div class="header">
-    <h2>💉 BioFlow Controller</h2>
+    <h2>💉 BioFlow Infusion Pump</h2>
     <div style="display:flex; gap:10px;">
       <span id="occlusionStatus" class="status-badge" style="display:none;"></span>
       <span id="wsStatus" class="status-badge" style="background: var(--danger);">Offline</span>
@@ -256,8 +256,8 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div class="tabs">
     <button class="tablink active" onclick="openTab(event, 'infusion')">Infusion</button>
     <button class="tablink" onclick="openTab(event, 'plotting')">Plotting</button>
-    <button class="tablink" onclick="openTab(event, 'config')">Manual Config & Safety Limits</button>
-    <button class="tablink" onclick="openTab(event, 'manual')">Manual Control & Reset</button>
+    <button class="tablink" onclick="openTab(event, 'manual')">Manual Config & Control</button>
+    <button class="tablink" onclick="openTab(event, 'safety')">Safety Limits & Reset</button>
     <button class="tablink" onclick="openTab(event, 'logs')">System Logs</button>
   </div>
 
@@ -363,7 +363,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <canvas id="chart2" height="100"></canvas>
   </div>
 
-  <div id="config" class="tab-content">
+  <div id="manual" class="tab-content">
     <div class="card grid-2">
       <div>
         <h3>Control Mode</h3>
@@ -372,7 +372,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <button class="btn" onclick="sendCmd('MODE SS')">State-Space</button>
       </div>
       <div>
-        <h3>Manual Overrides</h3>
+        <h3>Manual Control</h3>
         <div class="form-group">
           <label>Set PWM (0-255)</label>
           <input type="number" id="pwmIn" value="50">
@@ -386,6 +386,20 @@ const char index_html[] PROGMEM = R"rawliteral(
         <button class="btn" onclick="sendCmd('SP ' + document.getElementById('spIn').value)">Set PID/SS Rad/s</button>
       </div>
     </div>
+    <div class="card text-center">
+        <h3>Jog & Alignment</h3>
+        <button class="btn" onclick="sendCmd('FWD')">Direction: FORWARD</button>
+        <button class="btn" onclick="sendCmd('REV')">Direction: REVERSE</button>
+        <hr>
+        <button class="btn btn-success" onclick="sendCmd('GO')">MOTOR GO</button>
+        <button class="btn btn-danger" onclick="sendCmd('STOP')">MOTOR STOP</button>
+        <hr>
+        <button class="btn" onclick="sendCmd('STBY ON')">Enable Driver (STBY HIGH)</button>
+        <button class="btn" onclick="sendCmd('STBY OFF')">Disable Driver (STBY LOW)</button>
+      </div>
+  </div>
+
+  <div id="safety" class="tab-content">
     <div class="card">
       <h3>Safety Limits</h3>
       <div class="form-group">
@@ -398,20 +412,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       </div>
       <button class="btn" onclick="sendCmd('OC ' + document.getElementById('ocPct').value + ' ' + document.getElementById('ocDelay').value)">Update Current Limits</button>
     </div>
-  </div>
-
-  <div id="manual" class="tab-content">
     <div class="card text-center">
-      <h3>Jog & Alignment</h3>
-      <button class="btn" onclick="sendCmd('FWD')">Direction: FORWARD</button>
-      <button class="btn" onclick="sendCmd('REV')">Direction: REVERSE</button>
-      <hr>
-      <button class="btn btn-success" onclick="sendCmd('GO')">MOTOR GO</button>
-      <button class="btn btn-danger" onclick="sendCmd('STOP')">MOTOR STOP</button>
-      <hr>
-      <button class="btn" onclick="sendCmd('STBY ON')">Enable Driver (STBY HIGH)</button>
-      <button class="btn" onclick="sendCmd('STBY OFF')">Disable Driver (STBY LOW)</button>
-      <hr>
+      <h3>Reset & Reboot</h3>
       <button class="btn btn-danger" onclick="sendCmd('RESET')">SYSTEM RESET & ZERO ENCODER</button>
       <hr>
       <button class="btn btn-danger" onclick="sendCmd('REBOOT')">REBOOT ESP32</button>
